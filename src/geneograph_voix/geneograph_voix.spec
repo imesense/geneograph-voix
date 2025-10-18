@@ -9,7 +9,9 @@ a = Analysis( # type: ignore
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'webrtcvad'
+    ],
     noarchive=False,
     optimize=0,
 )
