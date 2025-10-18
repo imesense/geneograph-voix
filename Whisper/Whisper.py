@@ -55,9 +55,24 @@ PREVIEW_CLEAR_DELAY_MS = 1800    # preview clears ~1.8s after commit
 DATA_FILE = "records.csv"
 COLUMN_WIDTHS_FILE = "column_widths.json"
 GLOSSARY_FILE = "glossary.json"  # external glossary mapping: { "Header": ["term1", "term2", ...], ... }
+SETTINGS_FILE = "settings.json"
 NAME_COLUMNS = {"Имя", "Фамилия", "Имя отца", "Имя матери", "Имя Матери"} 
 
 VOWELS_RU = set("аеёиоуыэюя")
+
+# --- Whisper language dropdown (labels ↔ codes) ---
+WHISPER_LANG_CHOICES = [
+    ("Auto (detect)", "auto"),
+    ("Russian",   "ru"),
+    ("Ukrainian", "uk"),
+    ("Polish",    "pl"),
+    ("English",   "en"),
+    ("German",    "de"),
+]
+_LANG_LABELS = [lbl for (lbl, _) in WHISPER_LANG_CHOICES]
+_LABEL_TO_CODE = {lbl: code for (lbl, code) in WHISPER_LANG_CHOICES}
+_CODE_TO_LABEL = {code: lbl for (lbl, code) in WHISPER_LANG_CHOICES}
+
 
 # Male names that end with "а/я" (should count as male)
 MALE_EXCEPTIONS = {
@@ -135,6 +150,80 @@ warnings.filterwarnings("ignore")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Loading Whisper model ({MODEL_SIZE}) on {device}...")
 model = WhisperModel(MODEL_SIZE, device=device, compute_type=COMPUTE_TYPE)
+
+
+
+# ----------------------------
+#  Settings helpers
+# ----------------------------
+
+def _read_settings_from_file() -> dict:
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            if isinstance(s, dict):
+                return s
+    except Exception as e:
+        print("settings load error:", e)
+    return {}
+
+def _apply_settings_to_globals(s: dict):
+    """Apply dict to module-level knobs (no side-effects like UI/VAD here)."""
+    global LANGUAGE, AUTOSAVE_EVERY_MS, VAD_AGGRESSIVENESS, UI_SCALE
+    try:
+        if "language" in s and isinstance(s["language"], str) and s["language"].strip():
+            LANGUAGE = s["language"].strip()
+        if "autosave_minutes" in s:
+            m = int(s["autosave_minutes"])
+            AUTOSAVE_EVERY_MS = max(1, m) * 60 * 1000
+        if "vad_aggr" in s:
+            VAD_AGGRESSIVENESS = max(0, min(3, int(s["vad_aggr"])))
+        if "ui_scale" in s:
+            UI_SCALE = float(s["ui_scale"])
+    except Exception as e:
+        print("settings apply error:", e)
+
+def _reinit_webrtc_vad():
+    """Recreate WebRTC VAD object after aggressiveness change."""
+    global _vad, _has_vad
+    try:
+        if USE_WEBRTC_VAD and webrtcvad is not None:
+            _vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+            _has_vad = True
+        else:
+            _vad = None
+    except Exception as e:
+        print("reinit VAD error:", e)
+        
+def _current_settings(self) -> dict:
+    # LANGUAGE may be "auto", None, or a whisper code
+    lang_code = "auto" if (LANGUAGE is None or str(LANGUAGE).lower() == "auto") else str(LANGUAGE)
+    return {
+        "language": lang_code,
+        "autosave_minutes": int(AUTOSAVE_EVERY_MS // 60000),
+        "vad_aggr": VAD_AGGRESSIVENESS,
+        "ui_scale": UI_SCALE,
+    }
+
+def apply_settings(self, s: dict):
+    global LANGUAGE, AUTOSAVE_EVERY_MS, VAD_AGGRESSIVENESS, UI_SCALE
+    # language
+    LANGUAGE = s.get("language", "auto")
+    # autosave
+    AUTOSAVE_EVERY_MS = max(1, int(s.get("autosave_minutes", 5))) * 60 * 1000
+    self._start_autosave()
+    # VAD
+    try:
+        VAD_AGGRESSIVENESS = int(s.get("vad_aggr", VAD_AGGRESSIVENESS))
+    except Exception:
+        pass
+    # UI scale (takes effect on next launch or you can reapply fonts/colors if desired)
+    try:
+        UI_SCALE = float(s.get("ui_scale", UI_SCALE))
+    except Exception:
+        pass
+
 
 # ----------------------------
 #  Glossary helpers
@@ -599,13 +688,22 @@ def looks_like_outro(s: str) -> bool:
 # ----------------------------
 # TRANSCRIBE FUNCTIONS
 # ----------------------------
+
+def _effective_language():
+    # None -> auto-detect for faster-whisper
+    if LANGUAGE is None:
+        return None
+    if isinstance(LANGUAGE, str) and LANGUAGE.strip().lower() in ("", "auto"):
+        return None
+    return LANGUAGE
+
 def transcribe_buffer(buffer):
     if buffer.shape[0] == 0:
         return ""
     samples = buffer.flatten()
     segments, _ = model.transcribe(
         samples,
-        language=LANGUAGE,
+        language=_effective_language(),
         beam_size=5,
         vad_filter=True,
         vad_parameters=dict(min_silence_duration_ms=300, speech_pad_ms=200),
@@ -655,7 +753,7 @@ def transcribe_buffer_commit(buffer):
     try:
         segments, info = model.transcribe(
             samples,
-            language=LANGUAGE,
+            language=_effective_language(),
             beam_size=5,
             temperature=0.0,
             without_timestamps=True,
@@ -671,7 +769,7 @@ def transcribe_buffer_commit(buffer):
     except TypeError:
         segments, info = model.transcribe(
             samples,
-            language=LANGUAGE,
+            language=_effective_language(),
             beam_size=5,
             temperature=0.0,
             vad_filter=True,
@@ -712,7 +810,7 @@ def transcribe_buffer_commit(buffer):
         try:
             segments2, info2 = model.transcribe(
                 samples,
-                language=LANGUAGE,
+                language=_effective_language(),
                 beam_size=1,
                 temperature=0.0,
                 without_timestamps=True,
@@ -727,7 +825,7 @@ def transcribe_buffer_commit(buffer):
         except TypeError:
             segments2, info2 = model.transcribe(
                 samples,
-                language=LANGUAGE,
+                language=_effective_language(),
                 beam_size=1,
                 temperature=0.0,
                 vad_filter=True,
@@ -925,14 +1023,50 @@ def _style_ttk(dark=True):
     if not ttk:
         return
     style = ttk.Style()
-    try: style.theme_use("clam")
-    except Exception: pass
+    try:
+        style.theme_use("clam")  # needed so fieldbackground takes effect
+    except Exception:
+        pass
+
     c = _gfm_palette(dark)
+
     style.configure(".", background=c["bg"], foreground=c["text"])
     style.configure("TFrame", background=c["bg"])
     style.configure("TLabel", background=c["bg"], foreground=c["text"])
     style.configure("TEntry", fieldbackground=c["entry_bg"], foreground=c["entry_fg"], bordercolor=c["border"])
-    style.map("TEntry", fieldbackground=[("disabled", c["button_disabled_bg"])], foreground=[("disabled", c["button_disabled_fg"])])
+    style.map("TEntry",
+              fieldbackground=[("disabled", c["button_disabled_bg"])],
+              foreground=[("disabled", c["button_disabled_fg"])]
+    )
+
+    # ---- Style for combobox (dropdown) ----
+    style.configure(
+        "Settings.TCombobox",
+        background=c["entry_bg"],     # outer
+        fieldbackground=c["entry_bg"],# inner text area
+        foreground=c["entry_fg"],
+        bordercolor=c["border"],
+        lightcolor=c["border"],
+        darkcolor=c["border"],
+    )
+    # Make sure readonly state keeps dark background
+    style.map(
+        "Settings.TCombobox",
+        fieldbackground=[
+            ("readonly", c["entry_bg"]),
+            ("!disabled", c["entry_bg"]),
+        ],
+        foreground=[
+            ("readonly", c["entry_fg"]),
+        ],
+        selectbackground=[
+            ("readonly", c["sel_bg"]),
+        ],
+        selectforeground=[
+            ("readonly", c["sel_fg"]),
+        ],
+    )
+
 
 def _try_style_tksheet(root: "tk.Tk", dark=True):
     try:
@@ -1032,6 +1166,10 @@ class SpeechSheetApp:
         
         self.auto_num_btn = tk.Button(btn_frame, text="🔢 Auto Numerate", command=self.auto_numerate)
         self.auto_num_btn.grid(row=0, column=6, padx=5)
+        
+        self.settings_btn = tk.Button(btn_frame, text="⚙️ Settings", command=self.open_settings)
+        self.settings_btn.grid(row=0, column=7, padx=5)
+
 
 
         # Preview label
@@ -1346,8 +1484,60 @@ class SpeechSheetApp:
         self.root.bind_all("<F1>", toggle_evt, add="+")
 
         # Bind Escape to stop
-        for seq in ("<Escape>", "<KeyPress-Escape>", "<F1>"):
+        for seq in ("<Escape>", "<KeyPress-Escape>"):
             self.root.bind_all(seq, stop_evt, add="+")
+            
+
+    def _current_settings(self) -> dict:
+        return {
+            "language": LANGUAGE,
+            "autosave_minutes": max(1, AUTOSAVE_EVERY_MS // 60000),
+            "vad_aggr": VAD_AGGRESSIVENESS,
+            "ui_scale": UI_SCALE,
+        }
+
+    def _save_settings_file(self, s: dict):
+        try:
+            tmp = os.path.join(os.path.dirname(SETTINGS_FILE) or ".", "~settings.tmp.json")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(s, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, SETTINGS_FILE)
+        except Exception as e:
+            print("settings save error:", e)
+
+    def _refresh_preview_font(self):
+        try:
+            sz = max(12, int(round(16 * UI_SCALE)))
+            self.preview_label.configure(font=("Calibri", sz, "bold"))
+        except Exception:
+            pass
+
+    def apply_settings(self, s: dict):
+        """Apply settings live: globals, autosave, VAD, UI rescale + persist."""
+        # 1) update globals
+        _apply_settings_to_globals(s)
+
+        # 2) persist to disk
+        self._save_settings_file(self._current_settings())
+
+        # 3) reinit VAD with new aggressiveness
+        _reinit_webrtc_vad()
+
+        # 4) restart autosave with new period
+        self._start_autosave()
+
+        # 5) re-apply UI scaling / fonts / tksheet geometry
+        try:
+            _apply_dark_ui(self.root, dark=True)
+            self._refresh_preview_font()
+            # buttons may lose colors after restyle; reapply
+            self._style_action_buttons()
+        except Exception as e:
+            print("re-apply UI error:", e)
+
+    def open_settings(self):
+        SettingsDialog(self.root, initial=self._current_settings(), on_apply=self.apply_settings)
+
 
         
     # ----------------------------
@@ -1993,10 +2183,144 @@ class GlossaryEditor(tk.Toplevel):
         finally:
             self.destroy()
 
+
+# ----------------------------
+# Settings
+# ----------------------------
+class SettingsDialog(tk.Toplevel):
+    def __init__(self, master, initial: dict, on_apply):
+        super().__init__(master)
+        self.title("Settings")
+        self.geometry("550x350")
+        self.minsize(380, 260)
+        self.transient(master)
+        self.on_apply = on_apply
+
+        c = _gfm_palette(True)
+        self.configure(bg=c["bg"])
+        
+        # ---- content frame (use grid inside) ----
+        frm = tk.Frame(self, bg=c["bg"])
+        frm.pack(fill="both", expand=True, padx=14, pady=12)
+
+        def lab(parent, txt):
+            return tk.Label(parent, text=txt, bg=c["bg"], fg=c["text"])
+
+        # ----- Language (dropdown) -----
+        lab(frm, "Recognition language").grid(row=0, column=0, sticky="w", pady=(0,4))
+        # figure out current label from code (supports None/"auto")
+        cur_code = str(initial.get("language", "auto")).lower() if initial.get("language", None) is not None else "auto"
+        cur_label = _CODE_TO_LABEL.get(cur_code, _CODE_TO_LABEL["auto"])
+
+        self.var_lang_label = tk.StringVar(value=cur_label)
+        if ttk:
+            self.cmb_lang = ttk.Combobox(frm, state="readonly", values=_LANG_LABELS, textvariable=self.var_lang_label)
+            self.cmb_lang.grid(row=1, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+        else:
+            # fallback widget
+            self.cmb_lang = tk.OptionMenu(frm, self.var_lang_label, *_LANG_LABELS)
+            self.cmb_lang.configure(bg=c["surface"], fg=c["text"], highlightthickness=1,
+                                    highlightbackground=c["border"], relief="flat")
+            self.cmb_lang.grid(row=1, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+            
+        self.cmb_lang = ttk.Combobox(
+            frm,
+            state="readonly",
+            values=_LANG_LABELS,
+            textvariable=self.var_lang_label,
+            style="Settings.TCombobox",   # ← add this
+        )
+        self.cmb_lang.grid(row=1, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+
+        # ----- Autosave -----
+        lab(frm, "Autosave period (minutes)").grid(row=2, column=0, sticky="w", pady=(0,4))
+        self.var_auto = tk.StringVar(value=str(initial.get("autosave_minutes", 5)))
+        e_auto = tk.Entry(frm, textvariable=self.var_auto, relief="flat",
+                          bg=c["surface"], fg=c["text"], insertbackground=c["text"])
+        e_auto.grid(row=3, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+
+        # ----- VAD aggressiveness -----
+        lab(frm, "VAD aggressiveness (0–3)").grid(row=4, column=0, sticky="w", pady=(0,4))
+        self.var_vad = tk.StringVar(value=str(initial.get("vad_aggr", 2)))
+        e_vad = tk.Entry(frm, textvariable=self.var_vad, relief="flat",
+                         bg=c["surface"], fg=c["text"], insertbackground=c["text"])
+        e_vad.grid(row=5, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+
+        # ----- UI Scale -----
+        lab(frm, "UI Scale (e.g., 1.00, 1.25)").grid(row=6, column=0, sticky="w", pady=(0,4))
+        self.var_scale = tk.StringVar(value=str(initial.get("ui_scale", 1.0)))
+        e_scale = tk.Entry(frm, textvariable=self.var_scale, relief="flat",
+                           bg=c["surface"], fg=c["text"], insertbackground=c["text"])
+        e_scale.grid(row=7, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+
+        frm.grid_columnconfigure(0, weight=1)
+
+        # ---- buttons (separate frame; pack is OK here) ----
+        btns = tk.Frame(self, bg=c["bg"])
+        btns.pack(fill="x", padx=14, pady=(0,12))
+
+        def _style_btn(b):
+            try:
+                b.configure(bg=c["button_bg"], fg=c["button_fg"],
+                            activebackground=c["button_active_bg"], activeforeground=c["button_fg"],
+                            relief="flat", highlightthickness=1,
+                            highlightbackground=c["button_border"], highlightcolor=c["button_border"])
+            except Exception:
+                pass
+
+        def _save_and_close():
+            # map label -> whisper code
+            sel_label = self.var_lang_label.get()
+            lang_code = _LABEL_TO_CODE.get(sel_label, "auto")
+
+            try:
+                auto_m = max(1, int(self.var_auto.get()))
+            except Exception:
+                messagebox.showerror("Invalid value", "Autosave must be an integer ≥ 1.")
+                return
+            try:
+                vad = int(self.var_vad.get())
+                if vad < 0 or vad > 3:
+                    raise ValueError()
+            except Exception:
+                messagebox.showerror("Invalid value", "VAD aggressiveness must be 0, 1, 2, or 3.")
+                return
+            try:
+                scale = float(self.var_scale.get())
+                if scale < 0.75 or scale > 2.5:
+                    raise ValueError()
+            except Exception:
+                messagebox.showerror("Invalid value", "UI Scale must be between 0.75 and 2.5.")
+                return
+
+            s = {
+                "language": lang_code,           # "ru", "uk", "pl", "en", "de", or "auto"
+                "autosave_minutes": auto_m,
+                "vad_aggr": vad,
+                "ui_scale": scale,
+            }
+            try:
+                self.on_apply(s)
+            finally:
+                self.destroy()
+
+        b_ok = tk.Button(btns, text="Save", command=_save_and_close)
+        b_cancel = tk.Button(btns, text="Cancel", command=self.destroy)
+        _style_btn(b_ok); _style_btn(b_cancel)
+        b_ok.pack(side="right", padx=(6,0))
+        b_cancel.pack(side="right")
+
+
+
 # ----------------------------
 # MAIN
 # ----------------------------
 if __name__ == "__main__":
+    # Load persisted settings, apply to globals first
+    _apply_settings_to_globals(_read_settings_from_file())
+    # Rebuild VAD with possibly-updated aggressiveness
+    _reinit_webrtc_vad()
+
     root = tk.Tk()
     try:
         enable_crisp_dark_mode(root, dark=True, delay_ms=350)
