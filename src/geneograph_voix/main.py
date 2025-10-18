@@ -1,27 +1,27 @@
-﻿import tkinter as tk
-
-
-from tksheet import Sheet
-from tkinter import filedialog, messagebox, simpledialog
-import sounddevice as sd
-import numpy as np
-import threading
+﻿import threading
 import queue
 import time
-import pandas as pd
-from faster_whisper import WhisperModel
-import torch
-import warnings
 import os
 import json
 import sys
 import re
-from collections import namedtuple
-from datetime import date
-from typing import Optional, List, Tuple, Callable
-from contextlib import contextmanager
+import warnings
 import unicodedata
+import torch
+
+import tkinter as tk
+import numpy as np
+import pandas as pd
+import sounddevice as sd
+
+from collections import namedtuple
+from contextlib import contextmanager
+from datetime import date
 from functools import lru_cache
+from typing import Optional, List, Tuple, Callable
+from tkinter import filedialog, messagebox, simpledialog
+from tksheet import Sheet
+from faster_whisper import WhisperModel
 
 # Try optional VAD packages safely
 try:

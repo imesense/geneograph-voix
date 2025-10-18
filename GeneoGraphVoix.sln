@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.10.34916.146
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{888888A0-9F3D-457C-B088-3A5042F75D52}") = "Whisper", "Whisper\Whisper.pyproj", "{B59F4103-12A1-4147-A04C-1DA989237C9B}"
+Project("{888888A0-9F3D-457C-B088-3A5042F75D52}") = "geneograph_voix", "src\geneograph_voix\geneograph_voix.pyproj", "{B59F4103-12A1-4147-A04C-1DA989237C9B}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

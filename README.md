@@ -25,7 +25,7 @@ pip install -r src\geneograph_voix\requirements.txt --cache-dir .pip
 Pack modules:
 
 ```powershell
-pyinstaller src\geneograph_voix\bundle.spec
+pyinstaller src\geneograph_voix\geneograph_voix.spec
 ```
 
 Deactivate virtual environment:
@@ -54,7 +54,7 @@ python3 -m pip install -r src/geneograph_voix/requirements.txt --cache-dir .pip
 Pack modules:
 
 ```sh
-pyinstaller src/geneograph_voix/bundle.spec
+pyinstaller src/geneograph_voix/geneograph_voix.spec
 ```
 
 Deactivate virtual environment:
