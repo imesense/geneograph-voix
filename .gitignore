@@ -3,3 +3,7 @@
 # System cache
 .DS_Store
 Thumbs.db
+
+settings.json
+glossary.json
+records.csv
