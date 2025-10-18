@@ -1,4 +1,6 @@
 ﻿import tkinter as tk
+
+
 from tksheet import Sheet
 from tkinter import filedialog, messagebox, simpledialog
 import sounddevice as sd
@@ -18,6 +20,8 @@ from collections import namedtuple
 from datetime import date
 from typing import Optional, List, Tuple, Callable
 from contextlib import contextmanager
+import unicodedata
+from functools import lru_cache
 
 # Try optional VAD packages safely
 try:
@@ -37,7 +41,7 @@ AUTOSAVE_EVERY_MS = 5 * 60 * 1000   # 5 minutes
 
 # --- WebRTC VAD settings (commit-time speech trimming) ---
 USE_WEBRTC_VAD     = True   # enable/disable trimming (falls back gracefully if module missing)
-VAD_AGGRESSIVENESS = 1      # 0..3 (higher = stricter)
+VAD_AGGRESSIVENESS = 2      # 0..3 (higher = stricter)
 VAD_FRAME_MS       = 20     # 10/20/30 ms
 VAD_HANG_MS        = 700    # ms of hangover after speech ends
 MIN_COMMIT_SEC     = 0.15   # skip decoding if trimmed speech is shorter than this
@@ -176,24 +180,35 @@ def _apply_settings_to_globals(s: dict):
         print("settings apply error:", e)
 
 def _reinit_webrtc_vad():
-    """Recreate WebRTC VAD object after aggressiveness change."""
+    """Recreate WebRTC VAD object after aggressiveness change (thread-safe)."""
     global _vad, _has_vad
     try:
-        if USE_WEBRTC_VAD and webrtcvad is not None:
-            _vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-            _has_vad = True
-        else:
-            _vad = None
-            _has_vad = False
+        with _vad_lock:
+            if USE_WEBRTC_VAD and webrtcvad is not None:
+                _vad = webrtcvad.Vad(int(VAD_AGGRESSIVENESS))
+                _has_vad = True
+            else:
+                _vad = None
+                _has_vad = False
     except Exception as e:
         print("reinit VAD error:", e)
-        _vad = None
-        _has_vad = False
+        with _vad_lock:
+            _vad = None
+            _has_vad = False
 
 # ----------------------------
 #  Glossary helpers
 # ----------------------------
 GLOSSARIES = {}  # populated by load_glossaries()
+
+# Versioning + caches for best-candidate lookups
+GLOSSARY_VER = 0
+BEST_CACHE_SINGLE: dict[tuple[str, str, int], tuple[Optional["_Best"], Optional["_Best"]]] = {}
+BEST_CACHE_MERGE: dict[tuple[str, str, int], tuple[Optional["_Best"], Optional["_Best"]]] = {}
+
+def _clear_best_caches():
+    BEST_CACHE_SINGLE.clear()
+    BEST_CACHE_MERGE.clear()
 
 def load_glossaries(path: str = GLOSSARY_FILE):
     """
@@ -204,6 +219,7 @@ def load_glossaries(path: str = GLOSSARY_FILE):
     }
     Unknown or missing file -> keep existing GLOSSARIES.
     """
+    global GLOSSARY_VER
     try:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
@@ -218,14 +234,33 @@ def load_glossaries(path: str = GLOSSARY_FILE):
                 if norm:
                     GLOSSARIES.clear()
                     GLOSSARIES.update(norm)
+                    GLOSSARY_VER += 1
+                    _clear_best_caches()
     except Exception as e:
         print("Glossary load error:", e)
 
 # ---- Conservative glossary correction ----
 
+def _strip_diacritics(s: str) -> str:
+    if not s:
+        return ""
+    # Normalize and strip combining marks (for Latin-based diacritics)
+    n = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in n if not unicodedata.combining(ch))
+
 def _ru_norm(s: str) -> str:
+    """
+    Language-aware normalization:
+      - lowercasing
+      - ё→е
+      - keep Cyrillic letters incl. Ukrainian: а-я + і ї є ґ
+      - strip Latin diacritics to base ASCII and keep a–z
+      - drop everything else
+    """
     t = (s or "").lower().replace("ё", "е")
-    t = re.sub(r"[^a-zа-я]+", "", t)
+    t = _strip_diacritics(t)
+    # Keep ASCII a-z and Cyrillic incl. Ukrainian extras
+    t = re.sub(r"[^a-zа-яіїєґ]+", "", t)
     return t
 
 def _ru_norm_merge(s: str) -> str:
@@ -237,8 +272,162 @@ def _ru_norm_merge(s: str) -> str:
     t = _ru_norm(s)
     return t.replace("тс", "ц")
 
+# --- Confusion / phonetic helpers for Russian/UA core ---
+
+CONFUSION_CLASSES = [
+    set("бп"), set("вф"), set("гкх"), set("дт"), set("зсц"),
+    set("жшщч"),  # merge strong sibilants
+]
+
+# Keyboard adjacency disabled (previous noisy map removed intentionally)
+KEYBOARD_NEIGHBORS_RU: dict[str, set[str]] = {}
+
+# Vowels: Cyrillic (ru/ua) + ASCII
+VOWELS_RU = set("аеёиоуыэюяіїеaeiouy")
+
+def _is_vowel_ru(ch: str) -> bool:
+    return ch in VOWELS_RU
+
+def _same_confusion_class(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    for grp in CONFUSION_CLASSES:
+        if a in grp and b in grp:
+            return True
+    return False
+
+@lru_cache(maxsize=8192)
+def ru_phon_key(s: str) -> str:
+    """
+    Very light 'phonetic' reduction for Russian-like strings:
+      - ё→е already handled in _ru_norm
+      - collapse voiced/voiceless pairs and sibilants
+      - collapse vowels to 5 buckets: a/e/i/o/u
+    """
+    s = s.replace("ё", "е")
+    out = []
+    for ch in s:
+        if ch in "бп":
+            out.append("b")
+        elif ch in "вф":
+            out.append("v")
+        elif ch in "гкхґ":
+            out.append("k")
+        elif ch in "дт":
+            out.append("t")
+        elif ch in "жшщч":
+            out.append("x")   # strong sibilants
+        elif ch in "зсц":
+            out.append("s")
+        elif ch in "й":
+            out.append("j")
+        elif ch in "а":
+            out.append("a")
+        elif ch in "еэє":
+            out.append("e")
+        elif ch in "иыії":
+            out.append("i")
+        elif ch in "о":
+            out.append("o")
+        elif ch in "ую":
+            out.append("u")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+# --- Weighted Damerau–Levenshtein (restricted) ---
+
+# Tunable costs
+_WDL_INS_COST   = 1.0
+_WDL_DEL_COST   = 1.0
+_WDL_SWAP_COST  = 0.8
+_WDL_CONF_COST  = 0.55   # same confusion class (в↔ф, к↔г, ...)
+_WDL_VOWEL_COST = 0.70   # vowel↔vowel
+_WDL_NEAR_COST  = 0.65   # keyboard neighbors
+_WDL_BASE_COST  = 1.0    # unrelated substitution
+
+_SPECIAL_PAIRS = {
+    ("й","и"): 0.45, ("и","й"): 0.45,
+    ("о","а"): 0.75, ("е","и"): 0.75, ("и","е"): 0.75,
+}
+
+def _sub_cost_ru(a: str, b: str) -> float:
+    if a == b:
+        return 0.0
+    if (a, b) in _SPECIAL_PAIRS:
+        return _SPECIAL_PAIRS[(a, b)]
+    if _same_confusion_class(a, b):
+        return _WDL_CONF_COST
+    if (_is_vowel_ru(a) and _is_vowel_ru(b)):
+        return _WDL_VOWEL_COST
+    if b in KEYBOARD_NEIGHBORS_RU.get(a, ()) or a in KEYBOARD_NEIGHBORS_RU.get(b, ()):
+        return _WDL_NEAR_COST
+    return _WDL_BASE_COST
+
+@lru_cache(maxsize=32768)
+def _wdl(a: str, b: str) -> float:
+    """
+    Restricted Damerau–Levenshtein with weighted substitutions
+    and constant insertion/deletion/swap costs.
+    Operates on already-normalized lowercase strings.
+    """
+    n, m = len(a), len(b)
+    if n == 0: return float(m)
+    if m == 0: return float(n)
+
+    dp = [[0.0]*(m+1) for _ in range(n+1)]
+    for i in range(1, n+1):
+        dp[i][0] = i * _WDL_DEL_COST
+    for j in range(1, m+1):
+        dp[0][j] = j * _WDL_INS_COST
+
+    for i in range(1, n+1):
+        ai = a[i-1]
+        for j in range(1, m+1):
+            bj = b[j-1]
+            sub = dp[i-1][j-1] + _sub_cost_ru(ai, bj)
+            ins = dp[i][j-1] + _WDL_INS_COST
+            dele= dp[i-1][j] + _WDL_DEL_COST
+            best = sub if sub <= ins and sub <= dele else (ins if ins <= dele else dele)
+
+            # transposition (restricted)
+            if i >= 2 and j >= 2 and a[i-1] == b[j-2] and a[i-2] == b[j-1]:
+                swap = dp[i-2][j-2] + _WDL_SWAP_COST
+                if swap < best:
+                    best = swap
+
+            dp[i][j] = best
+    return dp[n][m]
+
+def _combined_score(a_norm: str, b_norm: str) -> tuple[float, float, float, int]:
+    """
+    Return (score, wdl, dice, anchor) where lower score is better.
+    """
+    wdl  = _wdl(a_norm, b_norm)
+    dice = _dice_sim(a_norm, b_norm)
+    # phonetic rescue
+    a_ph = ru_phon_key(a_norm)
+    b_ph = ru_phon_key(b_norm)
+    phon = _wdl(a_ph, b_ph)
+
+    # anchor = max shared prefix/suffix
+    lcp  = _lcp_len(a_norm, b_norm)
+    lcs  = _lcs_len(a_norm, b_norm)
+    anchor = max(lcp, lcs)
+
+    # weighted mixture (tuned for short RU/UA names)
+    score = (
+        wdl
+        + 0.45 * phon
+        + (1.0 - dice)
+        - 0.10 * min(anchor, 5)
+    )
+    return score, wdl, dice, anchor
+
+
 BRIDGE_WORDS = {"в", "во", "и", "й", "а"}  # tiny words we can skip in 3-token merges
 
+@lru_cache(maxsize=8192)
 def _bigrams(s: str) -> set[str]:
     return {s[i:i+2] for i in range(len(s)-1)} if len(s) >= 2 else set()
 
@@ -299,9 +488,13 @@ def _min_dice_for_len(L: int) -> float:
     if L <= 10: return 0.77
     return 0.80
 
-_Best = namedtuple("_Best", "orig norm d dice lcp lcs")
+_Best = namedtuple("_Best", "orig norm d dice lcp lcs wdl phon")
 
-def _best_two_candidates(a_norm: str, g_norm: List[Tuple[str, str]]) -> Tuple[Optional[_Best], Optional[_Best]]:
+def _best_two_candidates(a_norm: str, g_norm: list[tuple[str, str]]) -> tuple[Optional[_Best], Optional[_Best]]:
+    """
+    Find best and runner-up candidates for given normalized input `a_norm`.
+    Ranking primarily by weighted DL, then by lower (1 - Dice), then anchor.
+    """
     if not a_norm:
         return None, None
 
@@ -312,64 +505,108 @@ def _best_two_candidates(a_norm: str, g_norm: List[Tuple[str, str]]) -> Tuple[Op
     last  = a_norm[-1] if a_norm else ""
     use_coarse = len(a_norm) >= 5
 
+    def _edge_ok(a_ch: str, b_ch: str) -> bool:
+        # relaxed: allow same confusion class at edges
+        if not a_ch or not b_ch:
+            return False
+        return a_ch == b_ch or _same_confusion_class(a_ch, b_ch)
+
     for orig, b in g_norm:
         if not b:
             continue
-        if use_coarse and not (b[0] == first or b[-1] == last):
+        if use_coarse and not (_edge_ok(first, b[0]) or _edge_ok(last, b[-1])):
             continue
 
-        d = _lev(a_norm, b)
-        if d > _len_aware_max_edits(max(len(a_norm), len(b))):
-            continue
+        # integer Levenshtein (legacy signal)
+        d_lev = _lev(a_norm, b)
 
+        # prune by classic len-aware max edits
+        L = max(len(a_norm), len(b))
+        if d_lev > _len_aware_max_edits(L):
+            # allow a soft pass if the weighted DL is still very small
+            # (e.g., confusable pairs): compute quick wdl and keep only if <= cap + 0.5
+            wdl_soft = _wdl(a_norm, b)
+            if wdl_soft > _len_aware_max_edits(L) + 0.5:
+                continue
+
+        # main metrics
         dice = _dice_sim(a_norm, b)
         lcp  = _lcp_len(a_norm, b)
         lcs  = _lcs_len(a_norm, b)
+        wdl  = _wdl(a_norm, b)
+        # phonetic DL for acceptance check (cheap to cache here)
+        phon = _wdl(ru_phon_key(a_norm), ru_phon_key(b))
 
-        cand = _Best(orig=orig, norm=b, d=d, dice=dice, lcp=lcp, lcs=lcs)
+        cand = _Best(orig=orig, norm=b, d=d_lev, dice=dice, lcp=lcp, lcs=lcs, wdl=wdl, phon=phon)
 
-        if (best is None
-            or d < best.d
-            or (d == best.d and dice > best.dice)):
+        def better(x: _Best, y: _Best) -> bool:
+            # prefer smaller wdl, then higher dice, then stronger anchor
+            if x.wdl != y.wdl:
+                return x.wdl < y.wdl
+            if x.dice != y.dice:
+                return x.dice > y.dice
+            return max(x.lcp, x.lcs) > max(y.lcp, y.lcs)
+
+        if best is None or better(cand, best):
             second = best
             best = cand
-        elif (second is None
-              or d < second.d
-              or (d == second.d and dice > second.dice)):
+        elif second is None or better(cand, second):
             second = cand
 
     return best, second
 
+def _best_two_cached(header: str, a_norm: str, g_norm: list[tuple[str, str]], *, is_merge: bool) -> tuple[Optional[_Best], Optional[_Best]]:
+    """
+    Cached wrapper keyed by (header, a_norm, GLOSSARY_VER, is_merge).
+    """
+    key = (header, a_norm, GLOSSARY_VER)
+    cache = BEST_CACHE_MERGE if is_merge else BEST_CACHE_SINGLE
+    if key in cache:
+        return cache[key]
+    res = _best_two_candidates(a_norm, g_norm)
+    cache[key] = res
+    return res
+
 def _should_correct_from_norm(a_norm: str, best: Optional[_Best], runner_up: Optional[_Best]) -> bool:
+    """
+    Hybrid acceptance with weighted DL (wdl), phonetic backstop, Dice and anchor.
+    Slightly lenient to catch 'Афгсентий' -> 'Авксентий', but still conservative.
+    """
     if not best or not a_norm:
         return False
 
     L = max(len(a_norm), len(best.norm))
-    d = best.d
+    wdl  = best.wdl
     dice = best.dice
+    anchor = max(best.lcp, best.lcs)
+    phon = best.phon
 
-    if d > _len_aware_max_edits(L):
-        return False
-    if dice < _min_dice_for_len(L):
-        return False
+    # Baseline thresholds
+    max_ed = _len_aware_max_edits(L) + 0.5   # allow half-point slack with weighted DL
+    min_d  = _min_dice_for_len(L) - 0.03     # tiny softening for hybrid scorer
+    req_anchor = 2 if L <= 5 else 3
 
-    required_anchor = 2 if L <= 5 else 3
-    if best.lcp < required_anchor and best.lcs < required_anchor:
+    # Phonetic rescue: if Dice is a bit low, accept with strong phonetic match
+    if dice < min_d and phon <= 1.0:
+        min_d -= 0.07   # allow slightly lower dice if phonetic distance is minimal
+
+    if wdl > max_ed:
+        return False
+    if dice < min_d:
+        return False
+    if anchor < req_anchor:
         return False
 
     if runner_up is None:
         return True
 
-    if d < runner_up.d:
-        return True
+    # Margin vs runner-up: compare combined scores
+    score_best, _, _, _   = _combined_score(a_norm, best.norm)
+    score_run , _, _, _   = _combined_score(a_norm, runner_up.norm)
 
-    if d == runner_up.d:
-        delta = 0.06 if L >= 8 else 0.08
-        if (best.lcp >= 4 or best.lcs >= 4 or L >= 10):
-            delta = max(0.02, delta - 0.03)
-        return dice >= runner_up.dice + delta
+    # Need a clear margin to avoid flip-flop corrections
+    return (score_run - score_best) >= 0.35
 
-    return False
 
 def _should_correct(token: str, best: Optional[_Best], runner_up: Optional[_Best]) -> bool:
     a_norm = _ru_norm(token)
@@ -394,8 +631,10 @@ def correct_text_for_column(text: str, header: str) -> str:
     out: List[str] = []
     i = 0
 
-    def _score(cand: _Best) -> float:
-        return cand.d + (1.0 - cand.dice)
+    def _score_from_norm(a_norm: str, cand: _Best) -> float:
+        # lower is better; use full combined score for consistency
+        sc, _, _, _ = _combined_score(a_norm, cand.norm)
+        return sc
 
     while i < len(tokens):
         tok = tokens[i]
@@ -410,10 +649,10 @@ def correct_text_for_column(text: str, header: str) -> str:
             joined2 = tok + tok2
             a_join2 = _ru_norm_merge(joined2)
             if a_join2:
-                bestm2, runnerm2 = _best_two_candidates(a_join2, g_norm_merge)
+                bestm2, runnerm2 = _best_two_cached(header, a_join2, g_norm_merge, is_merge=True)
                 if _should_correct_from_norm(a_join2, bestm2, runnerm2):
                     if len(a_join2) >= 5 and (bestm2.lcp >= 3 or bestm2.lcs >= 3):
-                        cand2 = (bestm2, _score(bestm2))
+                        cand2 = (bestm2, _score_from_norm(a_join2, bestm2))
 
         # 3-token merge (with/without bridge)
         if i + 2 < len(tokens):
@@ -423,21 +662,20 @@ def correct_text_for_column(text: str, header: str) -> str:
             joined123 = tok + tok2 + tok3
             a_join123 = _ru_norm_merge(joined123)
             if a_join123:
-                bestm3a, runnerm3a = _best_two_candidates(a_join123, g_norm_merge)
+                bestm3a, runnerm3a = _best_two_cached(header, a_join123, g_norm_merge, is_merge=True)
                 if _should_correct_from_norm(a_join123, bestm3a, runnerm3a):
                     if len(a_join123) >= 6 and (bestm3a.lcp >= 3 or bestm3a.lcs >= 3):
-                        cand3 = (bestm3a, _score(bestm3a))
+                        cand3 = (bestm3a, _score_from_norm(a_join123, bestm3a))
 
             tok2_clean = _ru_norm(tok2)
             if tok2_clean in BRIDGE_WORDS:
                 joined13 = tok + tok3
                 a_join13 = _ru_norm_merge(joined13)
                 if a_join13:
-                    bestm3b, runnerm3b = _best_two_candidates(a_join13, g_norm_merge)
+                    bestm3b, runnerm3b = _best_two_cached(header, a_join13, g_norm_merge, is_merge=True)
                     if _should_correct_from_norm(a_join13, bestm3b, runnerm3b):
                         if len(a_join13) >= 6 and (bestm3b.lcp >= 3 or bestm3b.lcs >= 3):
-                            if cand3 is None or _score(bestm3b) < cand3[1]:
-                                cand3 = (bestm3b, _score(bestm3b))
+                            cand3 = (bestm3b, _score_from_norm(a_join13, bestm3b))
 
         # choose best merge
         best_merge = cand2 if (cand2 and (not cand3 or cand2[1] <= cand3[1])) else cand3
@@ -445,17 +683,17 @@ def correct_text_for_column(text: str, header: str) -> str:
             ok1 = ok2 = False
             score1 = score2 = float("inf")
             if a:
-                best1, runner1 = _best_two_candidates(a, g_norm)
+                best1, runner1 = _best_two_cached(header, a, g_norm, is_merge=False)
                 ok1 = _should_correct(tok, best1, runner1)
                 if ok1 and best1:
-                    score1 = _score(best1)
+                    score1 = _score_from_norm(a, best1)
             if i + 1 < len(tokens):
                 a2 = _ru_norm(tokens[i + 1])
                 if a2:
-                    best2, runner2 = _best_two_candidates(a2, g_norm)
+                    best2, runner2 = _best_two_cached(header, a2, g_norm, is_merge=False)
                     ok2 = _should_correct(tokens[i + 1], best2, runner2)
                     if ok2 and best2:
-                        score2 = _score(best2)
+                        score2 = _score_from_norm(a2, best2)
 
             score_m = best_merge[1]
             if (not ok1 and not ok2) or (score_m + 0.30 <= min(score1, score2)):
@@ -465,7 +703,7 @@ def correct_text_for_column(text: str, header: str) -> str:
 
         # single-token fallback
         if a:
-            best, runner = _best_two_candidates(a, g_norm)
+            best, runner = _best_two_cached(header, a, g_norm, is_merge=False)
             if _should_correct(tok, best, runner):
                 out.append(best.orig)
             else:
@@ -541,31 +779,43 @@ try:
 except Exception:
     _vad = None
     _has_vad = False
+    
+# Protect access to _vad / _has_vad across threads
+_vad_lock = threading.RLock()
 
 def _float32_to_pcm16_bytes(x: np.ndarray) -> bytes:
     x = np.clip(x, -1.0, 1.0)
     return np.rint(x * 32767.0).astype(np.int16).tobytes()
 
 def _webrtc_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> Optional[np.ndarray]:
-    if not _has_vad or buf_f32 is None or getattr(buf_f32, "size", 0) == 0:
+    # snapshot the VAD pointer & flag under lock
+    with _vad_lock:
+        has_vad = _has_vad
+        vad_obj = _vad
+
+    if not has_vad or buf_f32 is None or getattr(buf_f32, "size", 0) == 0:
         return buf_f32
+
     samples_per_frame = int(sr * (VAD_FRAME_MS / 1000.0))
     if samples_per_frame <= 0:
         return buf_f32
     total = len(buf_f32)
     if total < samples_per_frame:
         return None
+
     bytes_all = _float32_to_pcm16_bytes(buf_f32)
     frame_bytes = samples_per_frame * 2
     frames = [bytes_all[i:i+frame_bytes] for i in range(0, len(bytes_all) - frame_bytes + 1, frame_bytes)]
     speech_flags = [False] * len(frames)
     for i, fb in enumerate(frames):
         try:
-            speech_flags[i] = _vad.is_speech(fb, sr)
+            speech_flags[i] = vad_obj.is_speech(fb, sr)
         except Exception:
             speech_flags[i] = False
+
     if sum(speech_flags) < max(2, int(0.1 * len(speech_flags))):
         return None
+
     hang_frames = int((VAD_HANG_MS / 1000.0) / (VAD_FRAME_MS / 1000.0))
     first = next((i for i, f in enumerate(speech_flags) if f), None)
     last = next((i for i in range(len(speech_flags)-1, -1, -1) if speech_flags[i]), None)
@@ -573,10 +823,12 @@ def _webrtc_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> Optional[np.n
         return None
     start = max(0, first - hang_frames); end = min(len(speech_flags) - 1, last + hang_frames)
     start_samp = start * samples_per_frame; end_samp = (end + 1) * samples_per_frame
+
     trimmed = buf_f32[start_samp:end_samp]
     if len(trimmed) < int(sr * MIN_COMMIT_SEC):
         return None
     return trimmed
+
 
 _has_silero = False
 try:
@@ -1087,6 +1339,8 @@ class SpeechSheetApp:
         
         self._last_preview_text = ""
         self._last_preview_ts = 0.0
+        
+        self._settings_applying = False
 
         # Buttons frame
         btn_frame = tk.Frame(root)
@@ -1132,16 +1386,29 @@ class SpeechSheetApp:
                         "Имя матери","Восприемник","Страница","Комментарий"]
         load_glossaries()
 
+        # Create the Sheet but do NOT grid yet
         self.sheet = Sheet(root, headers=self.headers, height=400, width=1000, zoom=TABLE_ZOOM_PCT)
+
+        # Apply saved widths immediately using the existing function
+        try:
+            self.load_column_widths()
+        except Exception as e:
+            print("initial load_column_widths error:", e)
+
+        # Now grid the Sheet (first paint uses the saved widths)
         self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
         self.sheet.enable_bindings(("single_select","row_select","column_select","arrowkeys","edit_cell",
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
-                                    "copy","cut","paste","delete","undo","double_click_column_resize","double_click_row_resize","rc_insert_column",
-                                    "rc_delete_column","rc_insert_row","rc_delete_row"))
+                                    "copy","cut","paste","delete","undo","double_click_column_resize",
+                                    "double_click_row_resize","rc_insert_column","rc_delete_column",
+                                    "rc_insert_row","rc_delete_row"))
 
         # Responsive layout
         root.grid_rowconfigure(2, weight=1)
         root.grid_columnconfigure(0, weight=1)
+
+        # Optional tiny fallback reapply in case the first map nudges sizes
+        self.root.after(60, self.load_column_widths)
 
         # Load saved column widths after rendering
         self.root.after(500, self.load_column_widths)
@@ -1536,17 +1803,31 @@ class SpeechSheetApp:
             pass
 
     def apply_settings(self, s: dict):
-        _apply_settings_to_globals(s)
-        self._save_settings_file(self._current_settings())
-        _reinit_webrtc_vad()
-        self._start_autosave()
+        prev = self._current_settings()
+        self._settings_applying = True
         try:
-            _apply_dark_ui(self.root, dark=True)
-            self._refresh_preview_font()
-            self._maybe_update_sheet_zoom()
-            self._style_action_buttons()
+            # 1) globals + persist
+            _apply_settings_to_globals(s)
+            self._save_settings_file(self._current_settings())
+
+            # 2) VAD reinit (now thread-safe + workers paused)
+            _reinit_webrtc_vad()
+
+            # 3) autosave tick reset
+            self._start_autosave()
+
+            # 4) Only restyle UI if UI-affecting knobs changed
+            ui_scale_changed = float(prev.get("ui_scale", 1.0)) != float(s.get("ui_scale", prev.get("ui_scale", 1.0)))
+            if ui_scale_changed:
+                _apply_dark_ui(self.root, dark=True)
+                self._refresh_preview_font()
+                self._maybe_update_sheet_zoom()
+                self._style_action_buttons()
+            # If only VAD/aggr changed, skip heavy restyle to keep UI snappy
         except Exception as e:
-            print("re-apply UI error:", e)
+            print("apply_settings error:", e)
+        finally:
+            self._settings_applying = False
 
     def open_settings(self):
         SettingsDialog(
@@ -1650,6 +1931,10 @@ class SpeechSheetApp:
     def transcribe_thread(self):
         temp_buffer = np.zeros((0, 1), dtype=np.float32)
         while self.is_listening:
+            # If settings are being applied, pause work to avoid races / jank
+            if getattr(self, "_settings_applying", False):
+                time.sleep(0.05)
+                continue
             while not audio_queue.empty():
                 temp_buffer = np.concatenate((temp_buffer, audio_queue.get()))
 
