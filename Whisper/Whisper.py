@@ -14,6 +14,7 @@ import os
 import json
 import sys
 import re
+from collections import namedtuple
 from datetime import date
 
 # Try optional VAD packages safely
@@ -34,17 +35,17 @@ AUTOSAVE_EVERY_MS = 5 * 60 * 1000   # 5 minutes
 
 # --- WebRTC VAD settings (commit-time speech trimming) ---
 USE_WEBRTC_VAD     = True   # enable/disable trimming (falls back gracefully if module missing)
-VAD_AGGRESSIVENESS = 2 # 0..3 (higher = stricter)
-VAD_FRAME_MS       = 30     # 10/20/30 ms
-VAD_HANG_MS        = 400    # ms of hangover after speech ends
-MIN_COMMIT_SEC     = 0.4    # skip decoding if trimmed speech is shorter than this
+VAD_AGGRESSIVENESS = 1 # 0..3 (higher = stricter)
+VAD_FRAME_MS       = 20     # 10/20/30 ms
+VAD_HANG_MS        = 500    # ms of hangover after speech ends
+MIN_COMMIT_SEC     = 0.20    # skip decoding if trimmed speech is shorter than this
 
 # --- Silero VAD (preferred) ---
 USE_SILERO_VAD = True
-SILERO_THRESHOLD = 0.60            # 0..1, higher = stricter
-SILERO_MIN_SPEECH_MS = 150
-SILERO_MIN_SILENCE_MS = 250
-SILERO_PAD_MS = 200
+SILERO_THRESHOLD = 0.40            # 0..1, higher = stricter
+SILERO_MIN_SPEECH_MS = 100
+SILERO_MIN_SILENCE_MS = 200
+SILERO_PAD_MS = 300
 
 # UI scaling & preview timing
 UI_SCALE = 1                  # 100% scale
@@ -55,6 +56,8 @@ DATA_FILE = "records.csv"
 COLUMN_WIDTHS_FILE = "column_widths.json"
 GLOSSARY_FILE = "glossary.json"  # external glossary mapping: { "Header": ["term1", "term2", ...], ... }
 NAME_COLUMNS = {"Имя", "Фамилия", "Имя отца", "Имя матери", "Имя Матери"} 
+
+VOWELS_RU = set("аеёиоуыэюя")
 
 # Male names that end with "а/я" (should count as male)
 MALE_EXCEPTIONS = {
@@ -165,111 +168,270 @@ def load_glossaries(path: str = GLOSSARY_FILE):
     except Exception as e:
         print("Glossary load error:", e)
         
-def _norm_ru_basic(s: str) -> str:
-    # lowercase + normalize ё→е + collapse spaces
-    s = (s or "").lower().replace("ё", "е")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+       
+# ---- Conservative glossary correction ----
 
-def levenshtein_distance(a: str, b: str) -> int:
-    """Correct DP Levenshtein on normalized strings (no j-1 underflow)."""
-    a = _norm_ru_basic(a)
-    b = _norm_ru_basic(b)
-    if a == b: return 0
-    if not a:  return len(b)
-    if not b:  return len(a)
-
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, start=1):
-        curr = [i]
-        for j, cb in enumerate(b, start=1):
-            ins = prev[j] + 1
-            del_ = curr[j - 1] + 1
-            sub = prev[j - 1] + (ca != cb)
-            curr.append(min(ins, del_, sub))
-        prev = curr
-    return prev[-1]
-
-
-def _ru_norm_for_match(s: str, collapse_boundary_ts: bool = True) -> str:
-    """
-    Normalize Russian text for fuzzy matching.
-    - lowercase, ё→е, drop ъ/ь
-    - keep spaces/hyphens to apply boundary rules
-    - ONLY fold 'т + (space|hyphen) + с' across boundary into 'ц'
-      (fixes 'Кот Сага' → 'Коцага')
-    - DO NOT touch 'дз' (legit digraph as in 'Дзецюл')
-    - remove spaces/hyphens for final key
-    """
-    t = (s or "").lower()
-    t = t.replace("ё", "е").replace("ъ", "").replace("ь", "")
-    # keep spaces/hyphens for boundary handling
-    t = re.sub(r"[^\w\s\-]+", " ", t, flags=re.UNICODE)
-    t = re.sub(r"\s+", " ", t).strip()
-
-    if collapse_boundary_ts:
-        # collapse only ACROSS WORD BOUNDARIES: 'т' + space/hyphen + 'с' -> 'ц'
-        # examples: "кот сага", "кот-сага" → "коцага"
-        t = re.sub(r"т[\s\-]+с", "ц", t)
-
-    # final compare key: strip spaces/hyphens
-    t = re.sub(r"[\s\-]+", "", t)
+def _ru_norm(s: str) -> str:
+    # keep only letters, normalize ё→е, lower
+    t = (s or "").lower().replace("ё", "е")
+    t = re.sub(r"[^a-zа-я]+", "", t)
     return t
 
-def _best_glossary_match(raw: str, terms: list[str]) -> tuple[str | None, int, float]:
-    """Return (best_term, edit_distance, distance_ratio) using normalized Levenshtein."""
-    nr = _ru_norm_for_match(raw)
-    best_term, best_d, best_r = None, 10**9, 1.0
-    for term in terms or []:
-        nt = _ru_norm_for_match(term, collapse_boundary_ts=False)  # glossary entries are already “as written”
-        if not nt:
+def _ru_norm_merge(s: str) -> str:
+    """
+    Merge-only normalization used when trying to glue tokens:
+    - start with _ru_norm
+    - collapse 'тс' -> 'ц' (helps 'Кот Сага' → 'Коцага')
+    """
+    t = _ru_norm(s)
+    return t.replace("тс", "ц")
+
+BRIDGE_WORDS = {"в", "во", "и", "й", "а"}  # tiny words we can skip in 3-token merges
+
+
+def _bigrams(s: str) -> set[str]:
+    return {s[i:i+2] for i in range(len(s)-1)} if len(s) >= 2 else set()
+
+def _dice_sim(a: str, b: str) -> float:
+    A, B = _bigrams(a), _bigrams(b)
+    if not A and not B:
+        return 1.0
+    if not A or not B:
+        return 0.0
+    inter = len(A & B)
+    return (2.0 * inter) / (len(A) + len(B))
+
+def _lcp_len(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+def _lcs_len(a: str, b: str) -> int:
+    # longest common suffix length
+    ia, ib = len(a)-1, len(b)-1
+    k = 0
+    while ia >= 0 and ib >= 0 and a[ia] == b[ib]:
+        k += 1; ia -= 1; ib -= 1
+    return k
+
+def _lev(a: str, b: str) -> int:
+    # small optimized Levenshtein (no external deps)
+    n, m = len(a), len(b)
+    if n == 0: return m
+    if m == 0: return n
+    if n > m:
+        a, b = b, a
+        n, m = m, n
+    prev = list(range(m+1))
+    for i in range(1, n+1):
+        cur = [i] + [0]*m
+        ca = a[i-1]
+        for j in range(1, m+1):
+            cb = b[j-1]
+            cost = 0 if ca == cb else 1
+            cur[j] = min(prev[j] + 1,      # deletion
+                         cur[j-1] + 1,      # insertion
+                         prev[j-1] + cost)  # substitution
+        prev = cur
+    return prev[m]
+
+def _len_aware_max_edits(L: int) -> int:
+    # very conservative per length
+    if L <= 4:  return 1
+    if L <= 6:  return 1
+    if L <= 8:  return 2
+    if L <= 10: return 2
+    return 3
+
+def _min_dice_for_len(L: int) -> float:
+    # +0.02 across the board (slightly stricter)
+    if L <= 4:  return 0.57
+    if L <= 6:  return 0.69
+    if L <= 8:  return 0.72
+    if L <= 10: return 0.77
+    return 0.80
+
+_Best = namedtuple("_Best", "orig norm d dice lcp lcs")
+
+
+def _best_two_candidates(a_norm: str, g_norm: list[tuple[str, str]]) -> tuple[_Best | None, _Best | None]:
+    """
+    Return best and runner-up (_Best objects) for a_norm.
+    Best is chosen by lower edit distance, then higher Dice.
+    """
+    if not a_norm:
+        return None, None
+
+    best: _Best | None = None
+    second: _Best | None = None
+
+    first = a_norm[0] if a_norm else ""
+    last  = a_norm[-1] if a_norm else ""
+    use_coarse = len(a_norm) >= 5
+
+    for orig, b in g_norm:
+        if not b:
             continue
-        d = levenshtein_distance(nr, nt)
-        r = d / max(1, len(nt))
-        if (r < best_r) or (r == best_r and d < best_d):
-            best_term, best_d, best_r = term, d, r
-    return best_term, best_d, best_r
+        if use_coarse and not (b[0] == first or b[-1] == last):
+            continue
+
+        d = _lev(a_norm, b)
+        if d > _len_aware_max_edits(max(len(a_norm), len(b))):
+            continue
+
+        dice = _dice_sim(a_norm, b)
+        lcp  = _lcp_len(a_norm, b)
+        lcs  = _lcs_len(a_norm, b)
+
+        cand = _Best(orig=orig, norm=b, d=d, dice=dice, lcp=lcp, lcs=lcs)
+
+        if (best is None
+            or d < best.d
+            or (d == best.d and dice > best.dice)):
+            second = best
+            best = cand
+        elif (second is None
+              or d < second.d
+              or (d == second.d and dice > second.dice)):
+            second = cand
+
+    return best, second
+
+
+def _should_correct(token: str, best: _Best | None, runner_up: _Best | None) -> bool:
+    """
+    Enforce max edits, min Dice, ≥3-char prefix/suffix anchor.
+    If runner-up ties on edit distance, allow when Dice is meaningfully better
+    (>= +0.08), or with strong anchor (lcp/lcs ≥ 4) and Dice >= +0.04.
+    """
+    if not best:
+        return False
+
+    a = _ru_norm(token)
+    b = best.norm
+    if not a or not b:
+        return False
+
+    L = max(len(a), len(b))
+    d = best.d
+    dice = best.dice
+
+    if d > _len_aware_max_edits(L):
+        return False
+    if dice < _min_dice_for_len(L):
+        return False
+    if best.lcp < 3 and best.lcs < 3:
+        return False
+
+    if runner_up is None:
+        return True
+
+    if d < runner_up.d:
+        return True
+
+    if d == runner_up.d:
+        if dice >= runner_up.dice + 0.08:
+            return True
+        if (best.lcp >= 4 or best.lcs >= 4) and (dice >= runner_up.dice + 0.04):
+            return True
+
+    return False
+
+
+
 
 def correct_text_for_column(text: str, header: str) -> str:
     """
-    Prefer a single-term (phrase-level) correction using the column's glossary.
-    If that fails, fall back to word-level correction.
-    Handles 'Кот Сага'→'Коцага' via boundary-only 'т с'→'ц' folding.
-    Preserves legit 'дз' (e.g., 'Дзецюл').
+    Conservative glossary correction with optional two-token merge.
+    - Only for GLOSSARY_COLUMNS present in GLOSSARIES
+    - Token-by-token correction as before
+    - If two adjacent tokens together look like one glossary entry (e.g., "Кот Сага" → "Коцага"),
+      merge them, but only when the merged candidate clearly wins.
     """
-    raw = (text or "").strip()
-    terms = GLOSSARIES.get(header) or []
-    if not raw or not terms:
-        return raw
+    if not text:
+        return ""
+    if header not in NAME_COLUMNS:
+        return text
 
-    # 1) Phrase-level: whole cell
-    best, d, r = _best_glossary_match(raw, terms)
-    if best:
-        max_abs = 2 if len(_ru_norm_for_match(best)) <= 6 else 3
-        if r <= 0.34 or d <= max_abs:
-            return best
+    glossary = GLOSSARIES.get(header) or []
+    if not glossary:
+        return text
 
-    # 2) Phrase-level: merged variant for two-token splits (e.g., "Кот Сага" -> "КотСага")
-    parts = raw.split()
-    if len(parts) == 2:
-        merged = "".join(parts)
-        best2, d2, r2 = _best_glossary_match(merged, terms)
-        if best2:
-            max_abs2 = 2 if len(_ru_norm_for_match(best2)) <= 6 else 3
-            if r2 <= 0.34 or d2 <= max_abs2:
-                return best2
+    # Pre-normalize glossary (add merge-view as well)
+    g_norm = [(g, _ru_norm(g)) for g in glossary if g and _ru_norm(g)]
+    g_norm_merge = [(g, _ru_norm_merge(g)) for g in glossary if g and _ru_norm_merge(g)]
+    if not g_norm:
+        return text
 
-    # 3) Fallback: gentle word-by-word correction
-    fixed = []
-    for w in parts:
-        cand, dw, rw = _best_glossary_match(w, terms)
-        if cand:
-            thr_abs = max(1, len(_ru_norm_for_match(cand)) // 3)
-            if rw <= 0.34 or dw <= thr_abs:
-                fixed.append(cand)
-                continue
-        fixed.append(w)
-    return " ".join(fixed)
+    tokens = text.split()
+    out: list[str] = []
+    i = 0
+
+    while i < len(tokens):
+        tok = tokens[i]
+        a = _ru_norm(tok)
+
+        # ---------- Try MERGES first (2-token and 3-token-with-bridge) ----------
+        def _score(cand: _Best) -> float:
+            return cand.d + (1.0 - cand.dice)  # lower is better
+
+        cand2 = None
+        if i + 1 < len(tokens):
+            tok2 = tokens[i + 1]
+            joined2 = tok + tok2
+            a_join2 = _ru_norm_merge(joined2)
+            if a_join2:
+                bestm2, runnerm2 = _best_two_candidates(a_join2, g_norm_merge)
+                if bestm2 and _should_correct(joined2, bestm2, runnerm2):
+                    if len(a_join2) >= 5 and (bestm2.lcp >= 3 or bestm2.lcs >= 3):
+                        cand2 = (bestm2, _score(bestm2))
+
+        cand3 = None
+        if i + 2 < len(tokens):
+            tok2 = tokens[i + 1]
+            tok3 = tokens[i + 2]
+
+            joined123 = tok + tok2 + tok3           # e.g., "А"+"в"+"ксентиево"
+            a_join123 = _ru_norm_merge(joined123)
+            if a_join123:
+                bestm3a, runnerm3a = _best_two_candidates(a_join123, g_norm_merge)
+                if bestm3a and _should_correct(joined123, bestm3a, runnerm3a):
+                    if len(a_join123) >= 6 and (bestm3a.lcp >= 3 or bestm3a.lcs >= 3):
+                        cand3 = (bestm3a, _score(bestm3a))
+
+            if tok2.lower() in BRIDGE_WORDS:
+                joined13 = tok + tok3                # skip bridge word
+                a_join13 = _ru_norm_merge(joined13)
+                if a_join13:
+                    bestm3b, runnerm3b = _best_two_candidates(a_join13, g_norm_merge)
+                    if bestm3b and _should_correct(joined13, bestm3b, runnerm3b):
+                        if len(a_join13) >= 6 and (bestm3b.lcp >= 3 or bestm3b.lcs >= 3):
+                            if cand3 is None or _score(bestm3b) < cand3[1]:
+                                cand3 = (bestm3b, _score(bestm3b))
+
+        best_merge = cand2 if (cand2 and (not cand3 or cand2[1] <= cand3[1])) else cand3
+        if best_merge is not None:
+            out.append(best_merge[0].orig)
+            i += 3 if (cand3 and best_merge == cand3) else 2
+            continue
+
+        # ---------- Fall back to single-token correction ----------
+        if a:
+            best, runner = _best_two_candidates(a, g_norm)
+            if _should_correct(tok, best, runner):
+                out.append(best.orig)
+            else:
+                out.append(tok)
+        else:
+            out.append(tok)
+
+        i += 1
+
+    return " ".join(out)
+
+
 
 # ----------------------------
 # Date normalization for "Дата"
