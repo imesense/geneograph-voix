@@ -3,5 +3,4 @@ numpy==1.24.2
 pandas==1.5.3
 sounddevice==0.5.2
 tksheet==7.5.16
-torch==2.5.1+cu121
 webrtcvad-wheels==2.0.14
