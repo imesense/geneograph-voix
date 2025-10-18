@@ -16,6 +16,8 @@ import sys
 import re
 from collections import namedtuple
 from datetime import date
+from typing import Optional, List, Tuple, Callable
+from contextlib import contextmanager
 
 # Try optional VAD packages safely
 try:
@@ -35,10 +37,10 @@ AUTOSAVE_EVERY_MS = 5 * 60 * 1000   # 5 minutes
 
 # --- WebRTC VAD settings (commit-time speech trimming) ---
 USE_WEBRTC_VAD     = True   # enable/disable trimming (falls back gracefully if module missing)
-VAD_AGGRESSIVENESS = 1 # 0..3 (higher = stricter)
+VAD_AGGRESSIVENESS = 1      # 0..3 (higher = stricter)
 VAD_FRAME_MS       = 20     # 10/20/30 ms
 VAD_HANG_MS        = 500    # ms of hangover after speech ends
-MIN_COMMIT_SEC     = 0.20    # skip decoding if trimmed speech is shorter than this
+MIN_COMMIT_SEC     = 0.20   # skip decoding if trimmed speech is shorter than this
 
 # --- Silero VAD (preferred) ---
 USE_SILERO_VAD = True
@@ -49,16 +51,13 @@ SILERO_PAD_MS = 300
 
 # UI scaling & preview timing
 UI_SCALE = 1                  # 100% scale
-TABLE_ZOOM_PCT = 135  # 100 = native, 125 = 1.25×
-PREVIEW_CLEAR_DELAY_MS = 1800    # preview clears ~1.8s after commit
+TABLE_ZOOM_PCT = 135          # 100 = native, 125 = 1.25×
+PREVIEW_CLEAR_DELAY_MS = 1800 # preview clears ~1.8s after commit
 
 DATA_FILE = "records.csv"
-COLUMN_WIDTHS_FILE = "column_widths.json"
 GLOSSARY_FILE = "glossary.json"  # external glossary mapping: { "Header": ["term1", "term2", ...], ... }
 SETTINGS_FILE = "settings.json"
-NAME_COLUMNS = {"Имя", "Фамилия", "Имя отца", "Имя матери", "Имя Матери"} 
-
-VOWELS_RU = set("аеёиоуыэюя")
+NAME_COLUMNS = {"Имя", "Фамилия", "Имя отца", "Имя матери", "Имя Матери"}
 
 # --- Whisper language dropdown (labels ↔ codes) ---
 WHISPER_LANG_CHOICES = [
@@ -72,7 +71,6 @@ WHISPER_LANG_CHOICES = [
 _LANG_LABELS = [lbl for (lbl, _) in WHISPER_LANG_CHOICES]
 _LABEL_TO_CODE = {lbl: code for (lbl, code) in WHISPER_LANG_CHOICES}
 _CODE_TO_LABEL = {code: lbl for (lbl, code) in WHISPER_LANG_CHOICES}
-
 
 # Male names that end with "а/я" (should count as male)
 MALE_EXCEPTIONS = {
@@ -97,10 +95,8 @@ BAN_PHRASES = tuple(s.lower() for s in (
 def _preview_is_banned(text: str) -> bool:
     """Cheap guard for preview: true if text looks like a banned/outro phrase."""
     try:
-        # Prefer your existing robust checker
         return looks_like_outro(text)
     except Exception:
-        # Fallback: simple normalized match
         t = (text or "").lower().replace("ё", "е")
         t = re.sub(r"[^a-zа-я0-9\s]+", " ", t)
         t = re.sub(r"\s+", " ", t).strip()
@@ -114,13 +110,10 @@ def clean_person_field(text: str) -> str:
     Removes dots, commas, quotes, digits, etc.
     """
     t = text or ""
-    # leave only letters; replace any non-letter with a space
-    t = re.sub(r"[^A-Za-zА-Яа-яЁё\-]+", " ", t)
-    # collapse whitespace
+    t = re.sub(r"[^A-Za-zА-Яа-яЁё\-]+", " ", t)  # keep letters and hyphen
     t = re.sub(r"\s+", " ", t).strip()
     if not t:
         return ""
-    # Proper case per word
     return " ".join(w[:1].upper() + w[1:].lower() if w else "" for w in t.split())
 
 # ----------------------------
@@ -150,8 +143,6 @@ warnings.filterwarnings("ignore")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Loading Whisper model ({MODEL_SIZE}) on {device}...")
 model = WhisperModel(MODEL_SIZE, device=device, compute_type=COMPUTE_TYPE)
-
-
 
 # ----------------------------
 #  Settings helpers
@@ -193,37 +184,11 @@ def _reinit_webrtc_vad():
             _has_vad = True
         else:
             _vad = None
+            _has_vad = False
     except Exception as e:
         print("reinit VAD error:", e)
-        
-def _current_settings(self) -> dict:
-    # LANGUAGE may be "auto", None, or a whisper code
-    lang_code = "auto" if (LANGUAGE is None or str(LANGUAGE).lower() == "auto") else str(LANGUAGE)
-    return {
-        "language": lang_code,
-        "autosave_minutes": int(AUTOSAVE_EVERY_MS // 60000),
-        "vad_aggr": VAD_AGGRESSIVENESS,
-        "ui_scale": UI_SCALE,
-    }
-
-def apply_settings(self, s: dict):
-    global LANGUAGE, AUTOSAVE_EVERY_MS, VAD_AGGRESSIVENESS, UI_SCALE
-    # language
-    LANGUAGE = s.get("language", "auto")
-    # autosave
-    AUTOSAVE_EVERY_MS = max(1, int(s.get("autosave_minutes", 5))) * 60 * 1000
-    self._start_autosave()
-    # VAD
-    try:
-        VAD_AGGRESSIVENESS = int(s.get("vad_aggr", VAD_AGGRESSIVENESS))
-    except Exception:
-        pass
-    # UI scale (takes effect on next launch or you can reapply fonts/colors if desired)
-    try:
-        UI_SCALE = float(s.get("ui_scale", UI_SCALE))
-    except Exception:
-        pass
-
+        _vad = None
+        _has_vad = False
 
 # ----------------------------
 #  Glossary helpers
@@ -249,19 +214,16 @@ def load_glossaries(path: str = GLOSSARY_FILE):
                     if isinstance(v, list):
                         norm[k] = [str(x) for x in v]
                     elif isinstance(v, dict):
-                        # allow dict; flatten keys as canonical terms
                         norm[k] = [str(x) for x in v.keys()]
                 if norm:
                     GLOSSARIES.clear()
                     GLOSSARIES.update(norm)
     except Exception as e:
         print("Glossary load error:", e)
-        
-       
+
 # ---- Conservative glossary correction ----
 
 def _ru_norm(s: str) -> str:
-    # keep only letters, normalize ё→е, lower
     t = (s or "").lower().replace("ё", "е")
     t = re.sub(r"[^a-zа-я]+", "", t)
     return t
@@ -276,7 +238,6 @@ def _ru_norm_merge(s: str) -> str:
     return t.replace("тс", "ц")
 
 BRIDGE_WORDS = {"в", "во", "и", "й", "а"}  # tiny words we can skip in 3-token merges
-
 
 def _bigrams(s: str) -> set[str]:
     return {s[i:i+2] for i in range(len(s)-1)} if len(s) >= 2 else set()
@@ -298,7 +259,6 @@ def _lcp_len(a: str, b: str) -> int:
     return i
 
 def _lcs_len(a: str, b: str) -> int:
-    # longest common suffix length
     ia, ib = len(a)-1, len(b)-1
     k = 0
     while ia >= 0 and ib >= 0 and a[ia] == b[ib]:
@@ -306,7 +266,6 @@ def _lcs_len(a: str, b: str) -> int:
     return k
 
 def _lev(a: str, b: str) -> int:
-    # small optimized Levenshtein (no external deps)
     n, m = len(a), len(b)
     if n == 0: return m
     if m == 0: return n
@@ -327,7 +286,6 @@ def _lev(a: str, b: str) -> int:
     return prev[m]
 
 def _len_aware_max_edits(L: int) -> int:
-    # very conservative per length
     if L <= 4:  return 1
     if L <= 6:  return 1
     if L <= 8:  return 2
@@ -335,7 +293,6 @@ def _len_aware_max_edits(L: int) -> int:
     return 3
 
 def _min_dice_for_len(L: int) -> float:
-    # +0.02 across the board (slightly stricter)
     if L <= 4:  return 0.57
     if L <= 6:  return 0.69
     if L <= 8:  return 0.72
@@ -344,17 +301,12 @@ def _min_dice_for_len(L: int) -> float:
 
 _Best = namedtuple("_Best", "orig norm d dice lcp lcs")
 
-
-def _best_two_candidates(a_norm: str, g_norm: list[tuple[str, str]]) -> tuple[_Best | None, _Best | None]:
-    """
-    Return best and runner-up (_Best objects) for a_norm.
-    Best is chosen by lower edit distance, then higher Dice.
-    """
+def _best_two_candidates(a_norm: str, g_norm: List[Tuple[str, str]]) -> Tuple[Optional[_Best], Optional[_Best]]:
     if not a_norm:
         return None, None
 
-    best: _Best | None = None
-    second: _Best | None = None
+    best: Optional[_Best] = None
+    second: Optional[_Best] = None
 
     first = a_norm[0] if a_norm else ""
     last  = a_norm[-1] if a_norm else ""
@@ -388,22 +340,11 @@ def _best_two_candidates(a_norm: str, g_norm: list[tuple[str, str]]) -> tuple[_B
 
     return best, second
 
-
-def _should_correct(token: str, best: _Best | None, runner_up: _Best | None) -> bool:
-    """
-    Enforce max edits, min Dice, ≥3-char prefix/suffix anchor.
-    If runner-up ties on edit distance, allow when Dice is meaningfully better
-    (>= +0.08), or with strong anchor (lcp/lcs ≥ 4) and Dice >= +0.04.
-    """
-    if not best:
+def _should_correct_from_norm(a_norm: str, best: Optional[_Best], runner_up: Optional[_Best]) -> bool:
+    if not best or not a_norm:
         return False
 
-    a = _ru_norm(token)
-    b = best.norm
-    if not a or not b:
-        return False
-
-    L = max(len(a), len(b))
+    L = max(len(a_norm), len(best.norm))
     d = best.d
     dice = best.dice
 
@@ -411,7 +352,9 @@ def _should_correct(token: str, best: _Best | None, runner_up: _Best | None) -> 
         return False
     if dice < _min_dice_for_len(L):
         return False
-    if best.lcp < 3 and best.lcs < 3:
+
+    required_anchor = 2 if L <= 5 else 3
+    if best.lcp < required_anchor and best.lcs < required_anchor:
         return False
 
     if runner_up is None:
@@ -421,24 +364,18 @@ def _should_correct(token: str, best: _Best | None, runner_up: _Best | None) -> 
         return True
 
     if d == runner_up.d:
-        if dice >= runner_up.dice + 0.08:
-            return True
-        if (best.lcp >= 4 or best.lcs >= 4) and (dice >= runner_up.dice + 0.04):
-            return True
+        delta = 0.06 if L >= 8 else 0.08
+        if (best.lcp >= 4 or best.lcs >= 4 or L >= 10):
+            delta = max(0.02, delta - 0.03)
+        return dice >= runner_up.dice + delta
 
     return False
 
-
-
+def _should_correct(token: str, best: Optional[_Best], runner_up: Optional[_Best]) -> bool:
+    a_norm = _ru_norm(token)
+    return _should_correct_from_norm(a_norm, best, runner_up)
 
 def correct_text_for_column(text: str, header: str) -> str:
-    """
-    Conservative glossary correction with optional two-token merge.
-    - Only for GLOSSARY_COLUMNS present in GLOSSARIES
-    - Token-by-token correction as before
-    - If two adjacent tokens together look like one glossary entry (e.g., "Кот Сага" → "Коцага"),
-      merge them, but only when the merged candidate clearly wins.
-    """
     if not text:
         return ""
     if header not in NAME_COLUMNS:
@@ -448,65 +385,85 @@ def correct_text_for_column(text: str, header: str) -> str:
     if not glossary:
         return text
 
-    # Pre-normalize glossary (add merge-view as well)
     g_norm = [(g, _ru_norm(g)) for g in glossary if g and _ru_norm(g)]
     g_norm_merge = [(g, _ru_norm_merge(g)) for g in glossary if g and _ru_norm_merge(g)]
     if not g_norm:
         return text
 
     tokens = text.split()
-    out: list[str] = []
+    out: List[str] = []
     i = 0
+
+    def _score(cand: _Best) -> float:
+        return cand.d + (1.0 - cand.dice)
 
     while i < len(tokens):
         tok = tokens[i]
         a = _ru_norm(tok)
 
-        # ---------- Try MERGES first (2-token and 3-token-with-bridge) ----------
-        def _score(cand: _Best) -> float:
-            return cand.d + (1.0 - cand.dice)  # lower is better
-
         cand2 = None
+        cand3 = None
+
+        # 2-token merge
         if i + 1 < len(tokens):
             tok2 = tokens[i + 1]
             joined2 = tok + tok2
             a_join2 = _ru_norm_merge(joined2)
             if a_join2:
                 bestm2, runnerm2 = _best_two_candidates(a_join2, g_norm_merge)
-                if bestm2 and _should_correct(joined2, bestm2, runnerm2):
+                if _should_correct_from_norm(a_join2, bestm2, runnerm2):
                     if len(a_join2) >= 5 and (bestm2.lcp >= 3 or bestm2.lcs >= 3):
                         cand2 = (bestm2, _score(bestm2))
 
-        cand3 = None
+        # 3-token merge (with/without bridge)
         if i + 2 < len(tokens):
             tok2 = tokens[i + 1]
             tok3 = tokens[i + 2]
 
-            joined123 = tok + tok2 + tok3           # e.g., "А"+"в"+"ксентиево"
+            joined123 = tok + tok2 + tok3
             a_join123 = _ru_norm_merge(joined123)
             if a_join123:
                 bestm3a, runnerm3a = _best_two_candidates(a_join123, g_norm_merge)
-                if bestm3a and _should_correct(joined123, bestm3a, runnerm3a):
+                if _should_correct_from_norm(a_join123, bestm3a, runnerm3a):
                     if len(a_join123) >= 6 and (bestm3a.lcp >= 3 or bestm3a.lcs >= 3):
                         cand3 = (bestm3a, _score(bestm3a))
 
-            if tok2.lower() in BRIDGE_WORDS:
-                joined13 = tok + tok3                # skip bridge word
+            tok2_clean = _ru_norm(tok2)
+            if tok2_clean in BRIDGE_WORDS:
+                joined13 = tok + tok3
                 a_join13 = _ru_norm_merge(joined13)
                 if a_join13:
                     bestm3b, runnerm3b = _best_two_candidates(a_join13, g_norm_merge)
-                    if bestm3b and _should_correct(joined13, bestm3b, runnerm3b):
+                    if _should_correct_from_norm(a_join13, bestm3b, runnerm3b):
                         if len(a_join13) >= 6 and (bestm3b.lcp >= 3 or bestm3b.lcs >= 3):
                             if cand3 is None or _score(bestm3b) < cand3[1]:
                                 cand3 = (bestm3b, _score(bestm3b))
 
+        # choose best merge
         best_merge = cand2 if (cand2 and (not cand3 or cand2[1] <= cand3[1])) else cand3
         if best_merge is not None:
-            out.append(best_merge[0].orig)
-            i += 3 if (cand3 and best_merge == cand3) else 2
-            continue
+            ok1 = ok2 = False
+            score1 = score2 = float("inf")
+            if a:
+                best1, runner1 = _best_two_candidates(a, g_norm)
+                ok1 = _should_correct(tok, best1, runner1)
+                if ok1 and best1:
+                    score1 = _score(best1)
+            if i + 1 < len(tokens):
+                a2 = _ru_norm(tokens[i + 1])
+                if a2:
+                    best2, runner2 = _best_two_candidates(a2, g_norm)
+                    ok2 = _should_correct(tokens[i + 1], best2, runner2)
+                    if ok2 and best2:
+                        score2 = _score(best2)
 
-        # ---------- Fall back to single-token correction ----------
+            score_m = best_merge[1]
+            if (not ok1 and not ok2) or (score_m + 0.30 <= min(score1, score2)):
+                out.append(best_merge[0].orig)
+                i += 3 if (cand3 and best_merge == cand3) else 2
+                continue
+
+        # single-token fallback
         if a:
             best, runner = _best_two_candidates(a, g_norm)
             if _should_correct(tok, best, runner):
@@ -520,8 +477,6 @@ def correct_text_for_column(text: str, header: str) -> str:
 
     return " ".join(out)
 
-
-
 # ----------------------------
 # Date normalization for "Дата"
 # ----------------------------
@@ -533,10 +488,9 @@ RU_MONTHS = {
 def _clean_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
-def normalize_date(text: str) -> str | None:
+def normalize_date(text: str) -> Optional[str]:
     t = (_clean_spaces(text or "")).lower()
 
-    # 31.08.2025  | 31/8/25 | 31-08-2025
     m = re.search(r"\b(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{2,4})\b", t)
     if m:
         d, mth, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -546,7 +500,6 @@ def normalize_date(text: str) -> str | None:
         except ValueError:
             return None
 
-    # "30 августа 2025" or "30 августа"
     m2 = re.search(r"\b(\d{1,2})\s+([а-яё]+)(?:\s+(\d{2,4}))?\b", t)
     if m2:
         mon = m2.group(2)
@@ -575,9 +528,8 @@ def strip_trailing_dot(text: str) -> str:
     return s
 
 # ----------------------------
-# VAD INIT & HELPERS (defined BEFORE commit function)
+# VAD INIT & HELPERS
 # ----------------------------
-# WebRTC
 _has_vad = False
 try:
     if USE_WEBRTC_VAD and webrtcvad is not None:
@@ -585,6 +537,7 @@ try:
         _has_vad = True
     else:
         _vad = None
+        _has_vad = False
 except Exception:
     _vad = None
     _has_vad = False
@@ -593,7 +546,7 @@ def _float32_to_pcm16_bytes(x: np.ndarray) -> bytes:
     x = np.clip(x, -1.0, 1.0)
     return np.rint(x * 32767.0).astype(np.int16).tobytes()
 
-def _webrtc_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> np.ndarray | None:
+def _webrtc_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> Optional[np.ndarray]:
     if not _has_vad or buf_f32 is None or getattr(buf_f32, "size", 0) == 0:
         return buf_f32
     samples_per_frame = int(sr * (VAD_FRAME_MS / 1000.0))
@@ -603,7 +556,7 @@ def _webrtc_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> np.ndarray | 
     if total < samples_per_frame:
         return None
     bytes_all = _float32_to_pcm16_bytes(buf_f32)
-    frame_bytes = samples_per_frame * 2  # 2 bytes/sample
+    frame_bytes = samples_per_frame * 2
     frames = [bytes_all[i:i+frame_bytes] for i in range(0, len(bytes_all) - frame_bytes + 1, frame_bytes)]
     speech_flags = [False] * len(frames)
     for i, fb in enumerate(frames):
@@ -625,7 +578,6 @@ def _webrtc_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> np.ndarray | 
         return None
     return trimmed
 
-# Silero
 _has_silero = False
 try:
     if USE_SILERO_VAD:
@@ -635,13 +587,13 @@ try:
             trust_repo=True,
             force_reload=False
         )
-        (get_speech_ts, _, read_audio, *_) = _silero_utils
+        (get_speech_ts, _, read_audio, *_) = _silero_utils  # read_audio unused
         _has_silero = True
 except Exception as e:
     print("Silero VAD not available:", e)
     _has_silero = False
 
-def _silero_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> np.ndarray | None:
+def _silero_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> Optional[np.ndarray]:
     if not _has_silero or buf_f32 is None or getattr(buf_f32, "size", 0) == 0:
         return buf_f32
     wav = torch.from_numpy(buf_f32).float()
@@ -672,7 +624,6 @@ def _norm_text_basic(s: str) -> str:
     return t
 
 def looks_like_outro(s: str) -> bool:
-    """True if text matches known 'credits/outro' patterns or explicit ban phrases."""
     t = _norm_text_basic(s)
     if any(_norm_text_basic(p) in t for p in BAN_PHRASES):
         return True
@@ -688,9 +639,7 @@ def looks_like_outro(s: str) -> bool:
 # ----------------------------
 # TRANSCRIBE FUNCTIONS
 # ----------------------------
-
 def _effective_language():
-    # None -> auto-detect for faster-whisper
     if LANGUAGE is None:
         return None
     if isinstance(LANGUAGE, str) and LANGUAGE.strip().lower() in ("", "auto"):
@@ -715,17 +664,12 @@ def transcribe_buffer(buffer):
     return text
 
 def transcribe_buffer_commit(buffer):
-    """
-    Commit-time transcription with Silero/WebRTC VAD + strict decoding + outro gating.
-    """
     if buffer is None or buffer.size == 0:
         return ""
 
-    # mono float32
     mono = buffer[:, 0] if getattr(buffer, "ndim", 0) > 1 else buffer
     mono = np.asarray(mono, dtype=np.float32, order="C")
 
-    # Prefer Silero → else WebRTC → else no trim
     use_trim = False
     trimmed = mono
     try:
@@ -739,17 +683,15 @@ def transcribe_buffer_commit(buffer):
         pass
 
     if use_trim and trimmed is None:
-        return ""  # chosen VAD says "no speech"
-    mono = trimmed  # if not using VAD, it's the original mono
+        return ""
+    mono = trimmed
 
-    # Light pre-emphasis for SNR (copy to avoid mutating upstream)
     if mono.shape[0] > 1:
         mono = mono.copy()
         mono[1:] = mono[1:] - 0.97 * mono[:-1]
 
     samples = mono.flatten()
 
-    # ---- Pass 1: deterministic, stricter heuristics ----
     try:
         segments, info = model.transcribe(
             samples,
@@ -781,7 +723,6 @@ def transcribe_buffer_commit(buffer):
     segs = list(segments)
     full_text = " ".join((s.text or "").strip() for s in segs).strip()
 
-    # ---- Decide if we should retry ----
     def _seg_suspicious(seg) -> bool:
         try:
             cr  = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
@@ -791,7 +732,7 @@ def transcribe_buffer_commit(buffer):
         except Exception:
             return False
 
-    bad_flags = [ _seg_suspicious(sg) for sg in segs ] if segs else []
+    bad_flags = [_seg_suspicious(sg) for sg in segs] if segs else []
     reason = None
     suspicious = False
 
@@ -802,8 +743,7 @@ def transcribe_buffer_commit(buffer):
     elif bad_flags and (sum(bad_flags) >= max(1, len(bad_flags)//2) or bad_flags[-1]):
         suspicious = True; reason = "metrics"
 
-    # ---- Retry (conservative) if needed ----
-    DEBUG_COMMIT = False  # set True to print gating details
+    DEBUG_COMMIT = False
     if suspicious:
         if DEBUG_COMMIT:
             print(f"[commit:retry] reason={reason} text='{full_text}'")
@@ -846,7 +786,7 @@ def transcribe_buffer_commit(buffer):
             except Exception:
                 return False
 
-        bad_flags2 = [ _seg_suspicious_retry(sg) for sg in segs2 ] if segs2 else []
+        bad_flags2 = [_seg_suspicious_retry(sg) for sg in segs2] if segs2 else []
         looks_outro = bool(alt and looks_like_outro(alt))
         metrics_bad = bool(bad_flags2 and (sum(bad_flags2) >= max(1, len(bad_flags2)//2) or bad_flags2[-1]))
         drop = (not alt) or looks_outro or metrics_bad
@@ -858,7 +798,6 @@ def transcribe_buffer_commit(buffer):
             return ""
         full_text = alt
 
-    # trailing dot cleanup on commit (also kept in preview)
     try:
         full_text = strip_trailing_dot(full_text)
     except Exception:
@@ -919,8 +858,6 @@ def _gfm_palette(dark=True):
             "button_active_bg": "#dfe6ee",
             "button_fg": "#0f141a",
             "button_border": "#cbd3dc",
-            "button_disabled_bg": "#f1f3f6",
-            "button_disabled_fg": "#98a2ad",
             "header_bg": "#f6f8fa",
             "header_fg": "#0f141a",
             "index_bg": "#f6f8fa",
@@ -945,7 +882,7 @@ def _auto_scaling(root: "tk.Tk"):
     try:
         dpi = root.winfo_fpixels('1i')
         scaling = max(1.0, float(dpi) / 72.0)
-        scaling = min(2.5, scaling * UI_SCALE)   # ⟵ apply UI scale on top of DPI
+        scaling = min(2.5, scaling * UI_SCALE)
         root.tk.call('tk', 'scaling', scaling)
     except Exception:
         pass
@@ -971,7 +908,6 @@ def _apply_fonts(root: "tk.Tk"):
     heading.configure(size=hsize, weight="bold", family=hfam)
     fixed.configure(size=mono, family=mfam)
 
-
 def _recolor_tk_widgets(root: "tk.Tk", dark=True):
     colors = _gfm_palette(dark)
     def walk(w):
@@ -982,8 +918,18 @@ def _recolor_tk_widgets(root: "tk.Tk", dark=True):
             try: w.configure(bg=colors["bg"], fg=colors["text"])
             except Exception: pass
         if isinstance(w, tk.Entry):
-            try: w.configure(bg=colors["entry_bg"], fg=colors["entry_fg"], insertbackground=colors["text"], highlightthickness=0, relief="flat")
-            except Exception: pass
+            try:
+                w.configure(
+                    bg=colors["surface"],
+                    fg=colors["entry_fg"],
+                    insertbackground=colors["text"],
+                    relief="flat",
+                    highlightthickness=1,
+                    highlightbackground=colors["border"],
+                    highlightcolor=colors["border"],
+                )
+            except Exception:
+                pass
         if isinstance(w, tk.Text):
             try: w.configure(bg=colors["surface"], fg=colors["text"], insertbackground=colors["text"], highlightthickness=0, relief="flat")
             except Exception: pass
@@ -1024,7 +970,7 @@ def _style_ttk(dark=True):
         return
     style = ttk.Style()
     try:
-        style.theme_use("clam")  # needed so fieldbackground takes effect
+        style.theme_use("clam")
     except Exception:
         pass
 
@@ -1033,40 +979,36 @@ def _style_ttk(dark=True):
     style.configure(".", background=c["bg"], foreground=c["text"])
     style.configure("TFrame", background=c["bg"])
     style.configure("TLabel", background=c["bg"], foreground=c["text"])
-    style.configure("TEntry", fieldbackground=c["entry_bg"], foreground=c["entry_fg"], bordercolor=c["border"])
+
+    # ttk.Entry style (in case it’s used)
+    style.configure("TEntry",
+                    fieldbackground=c["surface"],
+                    foreground=c["entry_fg"],
+                    bordercolor=c["border"])
     style.map("TEntry",
               fieldbackground=[("disabled", c["button_disabled_bg"])],
-              foreground=[("disabled", c["button_disabled_fg"])]
-    )
+              foreground=[("disabled", c["button_disabled_fg"])])
 
-    # ---- Style for combobox (dropdown) ----
+    # Combobox (dropdown) – visually distinct like entries
     style.configure(
         "Settings.TCombobox",
-        background=c["entry_bg"],     # outer
-        fieldbackground=c["entry_bg"],# inner text area
+        background=c["surface"],
+        fieldbackground=c["surface"],
         foreground=c["entry_fg"],
         bordercolor=c["border"],
         lightcolor=c["border"],
         darkcolor=c["border"],
     )
-    # Make sure readonly state keeps dark background
     style.map(
         "Settings.TCombobox",
         fieldbackground=[
-            ("readonly", c["entry_bg"]),
-            ("!disabled", c["entry_bg"]),
+            ("readonly", c["surface"]),
+            ("!disabled", c["surface"]),
         ],
-        foreground=[
-            ("readonly", c["entry_fg"]),
-        ],
-        selectbackground=[
-            ("readonly", c["sel_bg"]),
-        ],
-        selectforeground=[
-            ("readonly", c["sel_fg"]),
-        ],
+        foreground=[("readonly", c["entry_fg"])],
+        selectbackground=[("readonly", c["sel_bg"])],
+        selectforeground=[("readonly", c["sel_fg"])],
     )
-
 
 def _try_style_tksheet(root: "tk.Tk", dark=True):
     try:
@@ -1075,7 +1017,7 @@ def _try_style_tksheet(root: "tk.Tk", dark=True):
         return
     colors = _gfm_palette(dark)
 
-    def _sz(px):  # simple pixel/point scaler
+    def _sz(px):
         return max(8, int(round(px * UI_SCALE)))
 
     def walk(w):
@@ -1096,17 +1038,10 @@ def _try_style_tksheet(root: "tk.Tk", dark=True):
                         top_left_fg=colors["muted"],
                         selected_cells_bg=colors["sel_bg"],
                         selected_cells_fg=colors["sel_fg"],
-                        # scaled geometry
                         row_height=_sz(24),
                         header_height=_sz(26),
                         row_index_width=_sz(60),
                     )
-                    #try:
-                        #c.font(("Helvetica", _sz(11)))
-                        #c.header_font(("Helvetica", _sz(11), "bold"))
-                        #c.index_font(("Helvetica", _sz(11)))
-                    #except Exception:
-                        #pass
                 else:
                     walk(c)
             except Exception:
@@ -1135,11 +1070,11 @@ class SpeechSheetApp:
         self.root = root
         self.root.title("GeneoGraph VoIx")
         self.is_listening = False
-        
+
         self._autosave_job = None
         self._last_autosave_ok = True
         self._start_autosave()
-        
+
         self._bind_toggle_hotkeys()
 
         # Buttons frame
@@ -1163,14 +1098,12 @@ class SpeechSheetApp:
 
         self.glossary_btn = tk.Button(btn_frame, text="📚 Glossary", command=self.open_glossary_editor)
         self.glossary_btn.grid(row=0, column=5, padx=5)
-        
+
         self.auto_num_btn = tk.Button(btn_frame, text="🔢 Auto Numerate", command=self.auto_numerate)
         self.auto_num_btn.grid(row=0, column=6, padx=5)
-        
+
         self.settings_btn = tk.Button(btn_frame, text="⚙️ Settings", command=self.open_settings)
         self.settings_btn.grid(row=0, column=7, padx=5)
-
-
 
         # Preview label
         self.preview_label = tk.Label(
@@ -1178,12 +1111,10 @@ class SpeechSheetApp:
             text="Preview:",
             anchor="w",
             fg="#e6e6e6",
-            font=("Calibri", max(12, int(round(16 * UI_SCALE))), "bold")  # bigger preview
+            font=("Calibri", max(12, int(round(16 * UI_SCALE))), "bold")
         )
-
         self.preview_label.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
         self._preview_clear_after = None
-
 
         # Sheet
         self.headers = ["№","№ М","№ Ж","Дата","Имя","Фамилия","Имя отца",
@@ -1192,7 +1123,6 @@ class SpeechSheetApp:
 
         self.sheet = Sheet(root, headers=self.headers, height=400, width=1000, zoom=TABLE_ZOOM_PCT)
         self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
-        # Enable common bindings
         self.sheet.enable_bindings(("single_select","row_select","column_select","arrowkeys","edit_cell",
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
                                     "copy","cut","paste","delete","undo","double_click_column_resize","double_click_row_resize","rc_insert_column",
@@ -1204,7 +1134,6 @@ class SpeechSheetApp:
 
         # Load saved column widths after rendering
         self.root.after(500, self.load_column_widths)
-       
 
         # High-contrast action buttons
         self._style_action_buttons()
@@ -1219,39 +1148,171 @@ class SpeechSheetApp:
         # Handle close event
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    # ------- small helper: transient preview note -------
+    def _flash_preview_note(self, msg: str, ms: int = 1200):
+        try:
+            old = self.preview_label.cget("text")
+            self.preview_label.config(text=msg)
+            def _restore():
+                try:
+                    self.preview_label.config(text=old)
+                except Exception:
+                    pass
+            self.root.after(ms, _restore)
+        except Exception:
+            pass
+
+    # ----------------------------
+    # Column width helpers
+    # ----------------------------
+    def _snapshot_column_widths(self):
+        """Return current widths (list or dict) from tksheet."""
+        try:
+            if hasattr(self.sheet, "get_column_widths"):
+                return self.sheet.get_column_widths()
+            elif hasattr(self.sheet, "column_widths"):
+                return list(self.sheet.column_widths)
+        except Exception as e:
+            print("snapshot widths error:", e)
+        return None
+
+    def apply_column_widths(self, widths):
+        """Apply width structure returned by _snapshot_column_widths / settings."""
+        if widths is None:
+            return
+        try:
+            if isinstance(widths, dict):
+                iterable = widths.items()
+            elif isinstance(widths, list):
+                iterable = enumerate(widths)
+            else:
+                print("Unknown width data format:", type(widths))
+                return
+            for col, width in iterable:
+                try:
+                    self.sheet.column_width(int(col), int(width))
+                except Exception as e:
+                    print(f"column_width set failed for {col} -> {width}:", e)
+        except Exception as e:
+            print("apply_column_widths error:", e)
+
+    @contextmanager
+    def preserve_column_widths(self):
+        """Snapshot widths and restore them after the enclosed block."""
+        widths = self._snapshot_column_widths()
+        try:
+            yield
+        finally:
+            if widths is not None:
+                try:
+                    self.apply_column_widths(widths)
+                except Exception as e:
+                    print("restore widths error:", e)
+
     # ----------------------------
     # SHEET HELPERS
     # ----------------------------
     def _get_sheet_data_copy(self):
-        """
-        Cross-version safe: some tksheet builds don't support get_sheet_data(return_copy=True).
-        Always return a true list-of-lists copy that we can mutate.
-        """
         try:
-            # Newer tksheet (supports return_copy)
             return self.sheet.get_sheet_data(return_copy=True)
         except TypeError:
-            # Older tksheet
             data = self.sheet.get_sheet_data()
-            # Ensure a deep-ish copy as list of lists
             return [list(row) for row in data]
 
     def add_row(self):
-        # Preserve current widths
-        _w = self._snapshot_column_widths()
-
-        # Add a blank row (cross-version safe)
-        data = self._get_sheet_data_copy()
-        data.append([""] * len(self.headers))
-        self.sheet.set_sheet_data(data)
-
-        # Restore widths
-        self._restore_column_widths(_w)
-
+        # Preserve widths during structural change
+        with self.preserve_column_widths():
+            data = self._get_sheet_data_copy()
+            data.append([""] * len(self.headers))
+            self.sheet.set_sheet_data(data)
 
     def clear_all_cells(self):
-        rows = len(self.sheet.get_sheet_data())
-        self.sheet.set_sheet_data([[""] * len(self.headers) for _ in range(rows)])
+        # Preserve widths during mass update
+        with self.preserve_column_widths():
+            rows = len(self.sheet.get_sheet_data())
+            self.sheet.set_sheet_data([[""] * len(self.headers) for _ in range(rows)])
+
+    def _persist_column_widths_to_settings(self):
+        """Save current widths into settings.json under 'column_widths'."""
+        try:
+            if hasattr(self.sheet, "get_column_widths"):
+                widths = self.sheet.get_column_widths()
+            elif hasattr(self.sheet, "column_widths"):
+                widths = list(self.sheet.column_widths)
+            else:
+                return
+        except Exception:
+            return
+
+        try:
+            try:
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    s = json.load(f)
+            except Exception:
+                s = {}
+            s["column_widths"] = widths
+            tmp = os.path.join(os.path.dirname(SETTINGS_FILE) or ".", "~settings.tmp.json")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(s, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, SETTINGS_FILE)
+        except Exception as e:
+            print("persist widths error:", e)
+
+    def reset_column_widths(self):
+        """Reset to tksheet defaults: remove saved widths and rebuild Sheet."""
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                s = json.load(f)
+        except Exception:
+            s = {}
+        if "column_widths" in s:
+            s.pop("column_widths", None)
+            try:
+                tmp = os.path.join(os.path.dirname(SETTINGS_FILE) or ".", "~settings.tmp.json")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(s, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, SETTINGS_FILE)
+            except Exception as e:
+                print("reset widths persist error:", e)
+
+        data = self._get_sheet_data_copy()
+        try:
+            sel = list(self.sheet.get_selected_cells())[:1]
+        except Exception:
+            sel = []
+
+        try:
+            self.sheet.destroy()
+        except Exception:
+            pass
+
+        self.sheet = Sheet(self.root, headers=self.headers, height=400, width=1000, zoom=TABLE_ZOOM_PCT)
+        self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
+        self.sheet.enable_bindings((
+            "single_select","row_select","column_select","arrowkeys","edit_cell",
+            "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
+            "copy","cut","paste","delete","undo",
+            "double_click_column_resize","double_click_row_resize",
+            "rc_insert_column","rc_delete_column","rc_insert_row","rc_delete_row"
+        ))
+        self.sheet.set_sheet_data(data)
+
+        try:
+            _try_style_tksheet(self.root, dark=True)
+        except Exception:
+            pass
+
+        if sel:
+            r, c = sel[0]
+            try:
+                self.sheet.select_cell(r, c)
+            except Exception:
+                pass
+
+        try:
+            self.root.bell()
+        except Exception:
+            pass
 
     def add_text_to_cell(self, text):
         selected = self.sheet.get_selected_cells()
@@ -1272,16 +1333,12 @@ class SpeechSheetApp:
             self.sheet.set_cell_data(row, col, value)
             return
 
-        # 1) glossary correction first (keeps original logic, incl. phrase-level fixups)
         raw = correct_text_for_column(raw, header)
 
-        # 2) letters-only + proper case for person-name columns
         if header in NAME_COLUMNS:
             raw = clean_person_field(raw)
 
-        # 3) commit to the cell
         self.sheet.set_cell_data(row, col, raw)
-
 
     def open_glossary_editor(self):
         win = GlossaryEditor(self.root, GLOSSARY_FILE, on_saved=lambda: load_glossaries())
@@ -1289,9 +1346,8 @@ class SpeechSheetApp:
             enable_crisp_dark_mode(win, dark=True, delay_ms=0)
         except Exception:
             pass
-        
+
     def _start_autosave(self):
-        """Schedule the next autosave tick."""
         try:
             if self._autosave_job:
                 self.root.after_cancel(self._autosave_job)
@@ -1300,21 +1356,16 @@ class SpeechSheetApp:
         self._autosave_job = self.root.after(AUTOSAVE_EVERY_MS, self._autosave_tick)
 
     def _autosave_tick(self):
-        """Autosave only the table data; reschedule the next tick."""
         try:
-            self.save_data()  # data only; widths are saved on close
+            self.save_data()
             self._last_autosave_ok = True
-            # Optional: tiny console note (kept silent in UI)
-            # print(f"[autosave] {time.strftime('%H:%M:%S')}")
         except Exception as e:
             self._last_autosave_ok = False
             print("Autosave error:", e)
         finally:
-            # reschedule regardless of success/failure
             self._start_autosave()
 
     def _cancel_autosave(self):
-        """Cancel autosave timer safely (called on close)."""
         try:
             if self._autosave_job:
                 self.root.after_cancel(self._autosave_job)
@@ -1322,54 +1373,21 @@ class SpeechSheetApp:
         except Exception:
             pass
 
-    def _snapshot_column_widths(self):
-        """Return current widths in a form that apply_column_widths understands."""
-        try:
-            if hasattr(self.sheet, "get_column_widths"):
-                return self.sheet.get_column_widths()
-            elif hasattr(self.sheet, "column_widths"):
-                return list(self.sheet.column_widths)
-        except Exception as e:
-            print("snapshot widths error:", e)
-        return None
-
-    def _restore_column_widths(self, widths):
-        """Reapply widths captured by _snapshot_column_widths."""
-        if widths is None:
-            return
-        try:
-            self.apply_column_widths(widths)
-        except Exception as e:
-            print("restore widths error:", e)
-            
     def _ru_norm_name(self, s: str) -> str:
-        """Normalize a Russian name token for gender checks."""
         if not s:
             return ""
-        # keep cyrillic + hyphen/space, normalize ё→е
         s = s.replace("ё", "е").replace("Ё", "Е")
         s = re.sub(r"[^А-Яа-я\- ]+", "", s).strip()
         return s
 
     def _first_name_token(self, name: str) -> str:
-        """
-        Take the first meaningful token of the 'Имя' cell.
-        Handles things like 'Анна-Мария Петровна' -> 'Мария' (last part of first composite)
-        """
         n = self._ru_norm_name(name)
         if not n:
             return ""
-        first = n.split()[0]           # first word
-        # for double names "Анна-Мария" use the last segment for ending-based rules
+        first = n.split()[0]
         return first.split("-")[-1]
 
     def _gender_of_name(self, name: str) -> str:
-        """
-        Return 'м' (male), 'ж' (female), or '' if unknown/empty.
-        Rule: if in male exceptions → 'м';
-              elif ends with 'а' or 'я' → 'ж';
-              else → 'м'.
-        """
         tok = self._first_name_token(name)
         if not tok:
             return ""
@@ -1382,12 +1400,6 @@ class SpeechSheetApp:
         return "м"
 
     def auto_numerate(self):
-        """
-        Clear № М and № Ж entirely, then renumber:
-        male names -> № М (1..N), female names -> № Ж (1..M).
-        Preserves column widths.
-        """
-        # Find columns
         try:
             idx_m = self.headers.index("№ М")
             idx_f = self.headers.index("№ Ж")
@@ -1396,61 +1408,46 @@ class SpeechSheetApp:
             messagebox.showerror("Error", "Expected headers '№ М', '№ Ж', and 'Имя' were not found.")
             return
 
-        # Snapshot widths
-        widths_snapshot = None
-        try:
-            widths_snapshot = self._snapshot_column_widths()
-        except Exception:
-            pass
+        with self.preserve_column_widths():
+            rows_count = len(self.sheet.get_sheet_data())
 
-        rows_count = len(self.sheet.get_sheet_data())
+            for r in range(rows_count):
+                try:
+                    self.sheet.set_cell_data(r, idx_m, "")
+                    self.sheet.set_cell_data(r, idx_f, "")
+                except Exception:
+                    pass
 
-        # 1) Pre-clear both numbering columns
-        for r in range(rows_count):
-            try:
-                self.sheet.set_cell_data(r, idx_m, "")
-                self.sheet.set_cell_data(r, idx_f, "")
-            except Exception:
-                pass
+            male_counter = 0
+            female_counter = 0
+            for r in range(rows_count):
+                try:
+                    name_val = self.sheet.get_cell_data(r, idx_name)
+                except Exception:
+                    name_val = ""
 
-        # 2) Recompute numbers
-        male_counter = 0
-        female_counter = 0
-        for r in range(rows_count):
-            try:
-                name_val = self.sheet.get_cell_data(r, idx_name)
-            except Exception:
-                name_val = ""
-
-            g = self._gender_of_name(name_val)
-            if g == "м":
-                male_counter += 1
-                try: self.sheet.set_cell_data(r, idx_m, str(male_counter))
-                except Exception: pass
-            elif g == "ж":
-                female_counter += 1
-                try: self.sheet.set_cell_data(r, idx_f, str(female_counter))
-                except Exception: pass
-            # else: leave both blank
-
-        # Restore widths
-        try:
-            self._restore_column_widths(widths_snapshot)
-        except Exception:
-            pass
+                g = self._gender_of_name(name_val)
+                if g == "м":
+                    male_counter += 1
+                    try: self.sheet.set_cell_data(r, idx_m, str(male_counter))
+                    except Exception: pass
+                elif g == "ж":
+                    female_counter += 1
+                    try: self.sheet.set_cell_data(r, idx_f, str(female_counter))
+                    except Exception: pass
 
         try: self.root.bell()
         except Exception: pass
 
     def _bind_toggle_hotkeys(self):
-        """Shift+S toggles start/stop; Esc stops. Safe around text editing widgets."""
+        """F1 toggles start/stop; Esc stops. Safe around text editing widgets."""
         self._hotkey_cooldown_until = 0.0
 
         def _cooldown_ok():
             now = time.monotonic()
             if now < self._hotkey_cooldown_until:
                 return False
-            self._hotkey_cooldown_until = now + 0.25  # 250 ms debounce
+            self._hotkey_cooldown_until = now + 0.25
             return True
 
         def _in_text_edit():
@@ -1461,12 +1458,14 @@ class SpeechSheetApp:
                 cls = (w.winfo_class() or "").lower()
             except Exception:
                 cls = ""
-            # treat Tk/ttk entries (incl. tksheet's editor) as "editing"
             return isinstance(w, (tk.Entry, tk.Text)) or "entry" in cls or "text" in cls
 
         def toggle_evt(_=None):
             if _in_text_edit():
-                return  # don't toggle while typing
+                self._flash_preview_note("⚠ Горячая клавиша отключена во время редактирования ячейки")
+                try: self.root.bell()
+                except Exception: pass
+                return
             if not _cooldown_ok():
                 return
             if self.is_listening:
@@ -1480,17 +1479,13 @@ class SpeechSheetApp:
             if self.is_listening:
                 self.stop_listening()
 
-        # Bind F1 (several variants for Tk reliability)
         self.root.bind_all("<F1>", toggle_evt, add="+")
-
-        # Bind Escape to stop
         for seq in ("<Escape>", "<KeyPress-Escape>"):
             self.root.bind_all(seq, stop_evt, add="+")
-            
 
     def _current_settings(self) -> dict:
         return {
-            "language": LANGUAGE,
+            "language": LANGUAGE if LANGUAGE else "auto",
             "autosave_minutes": max(1, AUTOSAVE_EVERY_MS // 60000),
             "vad_aggr": VAD_AGGRESSIVENESS,
             "ui_scale": UI_SCALE,
@@ -1512,39 +1507,48 @@ class SpeechSheetApp:
         except Exception:
             pass
 
+    def _maybe_update_sheet_zoom(self):
+        try:
+            new_zoom = int(round(TABLE_ZOOM_PCT * float(UI_SCALE)))
+            if hasattr(self.sheet, "set_sheet_zoom"):
+                self.sheet.set_sheet_zoom(new_zoom)
+            elif hasattr(self.sheet, "set_zoom"):
+                self.sheet.set_zoom(new_zoom)
+            elif hasattr(self.sheet, "zoom"):
+                try:
+                    self.sheet.zoom = new_zoom
+                    if hasattr(self.sheet, "refresh"):
+                        self.sheet.refresh()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def apply_settings(self, s: dict):
-        """Apply settings live: globals, autosave, VAD, UI rescale + persist."""
-        # 1) update globals
         _apply_settings_to_globals(s)
-
-        # 2) persist to disk
         self._save_settings_file(self._current_settings())
-
-        # 3) reinit VAD with new aggressiveness
         _reinit_webrtc_vad()
-
-        # 4) restart autosave with new period
         self._start_autosave()
-
-        # 5) re-apply UI scaling / fonts / tksheet geometry
         try:
             _apply_dark_ui(self.root, dark=True)
             self._refresh_preview_font()
-            # buttons may lose colors after restyle; reapply
+            self._maybe_update_sheet_zoom()
             self._style_action_buttons()
         except Exception as e:
             print("re-apply UI error:", e)
 
     def open_settings(self):
-        SettingsDialog(self.root, initial=self._current_settings(), on_apply=self.apply_settings)
+        SettingsDialog(
+            self.root,
+            initial=self._current_settings(),
+            on_apply=self.apply_settings,
+            on_reset_widths=self.reset_column_widths,
+        )
 
-
-        
     # ----------------------------
     # AUDIO RESET
     # ----------------------------
     def reset_audio_state(self):
-        """Clear queued audio and preview so next session starts clean."""
         global audio_queue
         try:
             while not audio_queue.empty():
@@ -1561,12 +1565,10 @@ class SpeechSheetApp:
     # WINDOWS CONSOLE AUTO-CLOSE
     # ----------------------------
     def _detach_console_if_any(self):
-        """Detach from the console on Windows (no abnormal exit code)."""
         if sys.platform.startswith("win"):
             try:
                 import ctypes
                 kernel32 = ctypes.windll.kernel32
-                # If we have a console, just detach; do NOT post WM_CLOSE.
                 if kernel32.GetConsoleWindow():
                     kernel32.FreeConsole()
             except Exception:
@@ -1576,9 +1578,9 @@ class SpeechSheetApp:
     # ACTION BUTTON STYLING
     # ----------------------------
     def _style_action_buttons(self):
-        START_BG  = "#2e7d32"   # green
+        START_BG  = "#2e7d32"
         START_BG_H= "#2b7030"
-        STOP_BG   = "#c62828"   # red
+        STOP_BG   = "#c62828"
         STOP_BG_H = "#b12525"
         TXT_LIGHT = "#ffffff"
 
@@ -1637,21 +1639,17 @@ class SpeechSheetApp:
     def transcribe_thread(self):
         temp_buffer = np.zeros((0, 1), dtype=np.float32)
         while self.is_listening:
-            # accumulate incoming audio
             while not audio_queue.empty():
                 temp_buffer = np.concatenate((temp_buffer, audio_queue.get()))
 
-            # live preview for last ~1s (with trailing-dot cleanup)
             if len(temp_buffer) >= SAMPLERATE * 1:
                 preview_text = transcribe_buffer(temp_buffer[-SAMPLERATE:])
                 if preview_text and _preview_is_banned(preview_text):
-                    preview_text = ""  # hide banned/outro in preview
+                    preview_text = ""
                 if preview_text:
                     preview_text = strip_trailing_dot(preview_text)
                     self.root.after(0, lambda t=preview_text: self.preview_label.config(text="Preview: " + t))
 
-
-            # commit when silence tail indicates end-of-speech OR on timeout
             silence_tail = temp_buffer[-int(0.6 * SAMPLERATE):]
             timeout = len(temp_buffer) >= SAMPLERATE * BLOCK_DURATION
 
@@ -1659,23 +1657,16 @@ class SpeechSheetApp:
                 full_text = transcribe_buffer_commit(temp_buffer)
                 full_text = strip_trailing_dot(full_text)
 
-                # Optional: extra safety against banned/outro phrases
                 try:
                     if full_text and looks_like_outro(full_text):
                         full_text = ""
                 except NameError:
-                    pass  # looks_like_outro not defined in some builds
+                    pass
 
                 if full_text:
-                    # write to cell
                     self.root.after(0, self.add_text_to_cell, full_text)
-                    # show final text in preview as confirmation
-                    self.root.after(
-                        0,
-                        lambda t=full_text: self.preview_label.config(text="🎤 Preview: " + t)
-                    )
+                    self.root.after(0, lambda t=full_text: self.preview_label.config(text="🎤 Preview: " + t))
 
-                # cancel any previously scheduled clear, then schedule a new one
                 try:
                     if getattr(self, "_preview_clear_after", None):
                         self.root.after_cancel(self._preview_clear_after)
@@ -1692,18 +1683,16 @@ class SpeechSheetApp:
 
                 self._preview_clear_after = self.root.after(PREVIEW_CLEAR_DELAY_MS, _clear_preview)
 
-                # reset buffer for next utterance
                 temp_buffer = np.zeros((0, 1), dtype=np.float32)
 
-            time.sleep(0.2)
-
+            time.sleep(0.1)
 
     # ----------------------------
     # EXPORT / SAVE / LOAD
     # ----------------------------
     def export_data(self):
         data = self.sheet.get_sheet_data()
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(data, columns=self.headers)
         file_path = filedialog.asksaveasfilename(
             defaultextension=".xlsx",
             filetypes=[("Excel Files", "*.xlsx"), ("CSV Files", "*.csv")]
@@ -1725,69 +1714,45 @@ class SpeechSheetApp:
         if os.path.exists(DATA_FILE):
             df = pd.read_csv(DATA_FILE, encoding="utf-8-sig", keep_default_na=False)
             df = df.fillna("")
+            if list(df.columns) != self.headers and len(df.columns) == len(self.headers):
+                df.columns = self.headers
             self.sheet.set_sheet_data(df.values.tolist())
         else:
             for _ in range(20):
                 self.add_row()
 
     # ----------------------------
-    # COLUMN WIDTHS
+    # COLUMN WIDTHS (persist inside settings.json)
     # ----------------------------
     def save_column_widths(self):
-        try:
-            if hasattr(self.sheet, "get_column_widths"):
-                widths = self.sheet.get_column_widths()
-            elif hasattr(self.sheet, "column_widths"):
-                widths = list(self.sheet.column_widths)
-            else:
-                print("⚠ Could not retrieve column widths — attribute missing.")
-                return
-            with open(COLUMN_WIDTHS_FILE, "w", encoding="utf-8") as f:
-                json.dump(widths, f)
-            print("Column widths saved:", widths)
-        except Exception as e:
-            print("save_column_widths error:", e)
+        self._persist_column_widths_to_settings()
 
     def load_column_widths(self):
         try:
-            with open(COLUMN_WIDTHS_FILE, "r", encoding="utf-8") as f:
-                widths = json.load(f)
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                settings = json.load(f)
         except FileNotFoundError:
             return
         except Exception as e:
-            print("load_column_widths error:", e)
+            print("load_column_widths error (read):", e)
             return
-        self.apply_column_widths(widths)
 
-    def apply_column_widths(self, widths):
+        widths = settings.get("column_widths")
+        if widths is None:
+            return
+
         try:
-            if isinstance(widths, dict):
-                iterable = widths.items()
-            elif isinstance(widths, list):
-                iterable = enumerate(widths)
-            else:
-                print("Unknown width data format:", type(widths))
-                return
-            for col, width in iterable:
-                try:
-                    self.sheet.column_width(int(col), int(width))
-                except Exception as e:
-                    print(f"column_width set failed for {col} -> {width}:", e)
+            self.apply_column_widths(widths)
         except Exception as e:
-            print("apply_column_widths error:", e)
+            print("load_column_widths error (apply):", e)
 
     # ----------------------------
     # CLOSE
     # ----------------------------
     def on_close(self):
         try:
-            # stop any recognition loop
             self.is_listening = False
-
-            # cancel autosave timer
             self._cancel_autosave()
-
-            # cancel pending preview clear timer to avoid callbacks after destroy
             try:
                 if getattr(self, "_preview_clear_after", None):
                     self.root.after_cancel(self._preview_clear_after)
@@ -1795,18 +1760,14 @@ class SpeechSheetApp:
             except Exception:
                 pass
 
-            # persist data + widths
             self.save_data()
             self.save_column_widths()
         finally:
-            # Detach console instead of sending WM_CLOSE to it
             try:
                 self._detach_console_if_any()
             except Exception:
                 pass
-            # close the GUI
             self.root.destroy()
-
 
 # ----------------------------
 # Glossary Editor
@@ -1825,7 +1786,7 @@ class GlossaryEditor(tk.Toplevel):
         self.path = path
         self.on_saved = on_saved or (lambda: None)
 
-        # Theme colors
+        # Theme colors (fixed a typo in sel_bg hex)
         try:
             c = _gfm_palette(True)
         except Exception:
@@ -1837,7 +1798,7 @@ class GlossaryEditor(tk.Toplevel):
 
         self.configure(bg=c["bg"])
 
-        # --- Top action bar (ABOVE columns/terms) ---
+        # --- Top action bar ---
         topbar = tk.Frame(self, bg=c["surface"])
         topbar.pack(side="top", fill="x", padx=10, pady=(10, 6))
 
@@ -1857,7 +1818,7 @@ class GlossaryEditor(tk.Toplevel):
             _style_btn(w); w.pack(side="left", padx=4, pady=6)
         _style_btn(btn_close); btn_close.pack(side="right", padx=4, pady=6)
 
-        # --- Content area (Columns left, Terms right) ---
+        # --- Content area ---
         content = tk.Frame(self, bg=c["bg"])
         content.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 10))
 
@@ -1872,7 +1833,7 @@ class GlossaryEditor(tk.Toplevel):
         self.data: dict[str, list[str]] = {}
         self._load_from_file()
 
-        # ---------- Headers (left) ----------
+        # Headers list
         tk.Label(left, text="Columns", bg=c["bg"], fg=c["text"]).pack(anchor="w")
         self.headers_lb = tk.Listbox(
             left, exportselection=False, bg=c["surface"], fg=c["text"],
@@ -1880,7 +1841,6 @@ class GlossaryEditor(tk.Toplevel):
             highlightthickness=1, highlightbackground=c["border"], relief="flat"
         )
         self.headers_lb.pack(fill="both", expand=True)
-        # NOTE: no scrollbars for headers
 
         btns_h = tk.Frame(left, bg=c["bg"]); btns_h.pack(fill="x", pady=(6, 0))
         for txt, cmd in (("➕ Add", self._add_header),
@@ -1889,7 +1849,7 @@ class GlossaryEditor(tk.Toplevel):
             b = tk.Button(btns_h, text=txt, command=cmd)
             _style_btn(b); b.pack(side="left", padx=2)
 
-        # ---------- Terms (right) ----------
+        # Terms list
         tk.Label(right, text="Terms for selected column", bg=c["bg"], fg=c["text"]).pack(anchor="w")
 
         terms_wrap = tk.Frame(right, bg=c["bg"])
@@ -1902,7 +1862,6 @@ class GlossaryEditor(tk.Toplevel):
         )
         self.terms_lb.pack(side="left", fill="both", expand=True)
 
-        # Vertical scrollbar only
         tscroll_y = tk.Scrollbar(terms_wrap, orient="vertical")
         tscroll_y.pack(side="right", fill="y")
         self.terms_lb.configure(yscrollcommand=tscroll_y.set)
@@ -1920,7 +1879,7 @@ class GlossaryEditor(tk.Toplevel):
         except Exception:
             pass
 
-        # --- New term box (distinct card) ---
+        # New term card
         term_box = tk.Frame(right, bg=c["bg"])
         term_box.pack(fill="x", pady=(10, 0))
 
@@ -1954,10 +1913,17 @@ class GlossaryEditor(tk.Toplevel):
         term_btns = tk.Frame(term_box, bg=c["bg"]); term_btns.pack(fill="x")
         b_add = tk.Button(term_btns, text="➕ Add term", command=self._add_term)
         b_del = tk.Button(term_btns, text="🗑 Remove term", command=self._remove_term)
-        _style_btn(b_add); _style_btn(b_del)
+        def _style_btn2(b):
+            try:
+                b.configure(bg=c["button_bg"], fg=c["button_fg"],
+                            activebackground=c["button_active_bg"], activeforeground=c["button_fg"],
+                            relief="flat", highlightthickness=1,
+                            highlightbackground=c["button_border"], highlightcolor=c["button_border"])
+            except Exception:
+                pass
+        _style_btn2(b_add); _style_btn2(b_del)
         b_add.pack(side="left"); b_del.pack(side="left", padx=(6, 0))
 
-        # Bindings & initial fill
         self.headers_lb.bind("<<ListboxSelect>>", lambda e: self._refresh_terms())
         self._refresh_headers()
         if self.headers_lb.size() > 0:
@@ -1967,7 +1933,6 @@ class GlossaryEditor(tk.Toplevel):
             try: self.term_entry.focus_set()
             except Exception: pass
 
-        # Apply dark theme and persist our field style
         try:
             enable_crisp_dark_mode(self, dark=True, delay_ms=0)
         except Exception:
@@ -1977,10 +1942,8 @@ class GlossaryEditor(tk.Toplevel):
         except Exception:
             pass
 
-        # Auto-save on titlebar close
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    # ---------- File I/O ----------
     def _load_from_file(self):
         try:
             if os.path.exists(self.path):
@@ -2006,7 +1969,6 @@ class GlossaryEditor(tk.Toplevel):
             json.dump(self.data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, self.path)
 
-    # ---------- Styling helper ----------
     def _restyle_term_entry(self, c: dict):
         card_bg = c.get("elevated", "#1b212a")
         field_fg = c.get("text", "#e6e6e6")
@@ -2022,7 +1984,6 @@ class GlossaryEditor(tk.Toplevel):
         except Exception:
             pass
 
-    # ---------- Auto-size helpers ----------
     def _autosize_lists(self):
         try:
             from tkinter import font as _tkfont
@@ -2046,20 +2007,19 @@ class GlossaryEditor(tk.Toplevel):
         fit(self.headers_lb)
         fit(self.terms_lb)
 
-    # ---------- UI updates ----------
     def _refresh_headers(self):
         self.headers_lb.delete(0, "end")
         for k in sorted(self.data.keys(), key=str.lower):
             self.headers_lb.insert("end", k)
         self._autosize_lists()
 
-    def _current_header(self) -> str | None:
+    def _current_header(self) -> Optional[str]:
         sel = self.headers_lb.curselection()
         if not sel:
             return None
         return self.headers_lb.get(sel[0])
 
-    def _ensure_header_selected(self) -> str | None:
+    def _ensure_header_selected(self) -> Optional[str]:
         hdr = self._current_header()
         if hdr:
             return hdr
@@ -2079,7 +2039,6 @@ class GlossaryEditor(tk.Toplevel):
             self.terms_lb.insert("end", t)
         self._autosize_lists()
 
-    # ---------- Actions: headers ----------
     def _add_header(self):
         name = simpledialog.askstring("New column", "Column header:")
         if not name: return
@@ -2126,7 +2085,6 @@ class GlossaryEditor(tk.Toplevel):
         self._refresh_headers()
         self._refresh_terms()
 
-    # ---------- Actions: terms ----------
     def _add_term(self):
         hdr = self._ensure_header_selected()
         if not hdr:
@@ -2153,7 +2111,6 @@ class GlossaryEditor(tk.Toplevel):
         self.data[hdr] = [t for t in arr if t != term]
         self._refresh_terms()
 
-    # ---------- Save / Reload / Close ----------
     def _save(self):
         try:
             self._write_to_file()
@@ -2183,79 +2140,71 @@ class GlossaryEditor(tk.Toplevel):
         finally:
             self.destroy()
 
-
 # ----------------------------
 # Settings
 # ----------------------------
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, master, initial: dict, on_apply):
+    def __init__(self, master, initial: dict, on_apply: Callable[[dict], None], on_reset_widths: Optional[Callable[[], None]] = None):
         super().__init__(master)
         self.title("Settings")
-        self.geometry("550x350")
+        self.geometry("560x380")
         self.minsize(380, 260)
         self.transient(master)
         self.on_apply = on_apply
+        self.on_reset_widths = on_reset_widths
 
         c = _gfm_palette(True)
         self.configure(bg=c["bg"])
-        
-        # ---- content frame (use grid inside) ----
+
+        # Content
         frm = tk.Frame(self, bg=c["bg"])
         frm.pack(fill="both", expand=True, padx=14, pady=12)
 
         def lab(parent, txt):
             return tk.Label(parent, text=txt, bg=c["bg"], fg=c["text"])
 
-        # ----- Language (dropdown) -----
+        # Language
         lab(frm, "Recognition language").grid(row=0, column=0, sticky="w", pady=(0,4))
-        # figure out current label from code (supports None/"auto")
         cur_code = str(initial.get("language", "auto")).lower() if initial.get("language", None) is not None else "auto"
         cur_label = _CODE_TO_LABEL.get(cur_code, _CODE_TO_LABEL["auto"])
 
         self.var_lang_label = tk.StringVar(value=cur_label)
         if ttk:
-            self.cmb_lang = ttk.Combobox(frm, state="readonly", values=_LANG_LABELS, textvariable=self.var_lang_label)
+            self.cmb_lang = ttk.Combobox(
+                frm, state="readonly", values=_LANG_LABELS,
+                textvariable=self.var_lang_label, style="Settings.TCombobox",
+            )
             self.cmb_lang.grid(row=1, column=0, sticky="ew", padx=(0,6), pady=(0,10))
         else:
-            # fallback widget
             self.cmb_lang = tk.OptionMenu(frm, self.var_lang_label, *_LANG_LABELS)
-            self.cmb_lang.configure(bg=c["surface"], fg=c["text"], highlightthickness=1,
+            self.cmb_lang.configure(bg=c["surface"], fg=c["entry_fg"], highlightthickness=1,
                                     highlightbackground=c["border"], relief="flat")
             self.cmb_lang.grid(row=1, column=0, sticky="ew", padx=(0,6), pady=(0,10))
-            
-        self.cmb_lang = ttk.Combobox(
-            frm,
-            state="readonly",
-            values=_LANG_LABELS,
-            textvariable=self.var_lang_label,
-            style="Settings.TCombobox",   # ← add this
-        )
-        self.cmb_lang.grid(row=1, column=0, sticky="ew", padx=(0,6), pady=(0,10))
 
-        # ----- Autosave -----
+        # Autosave
         lab(frm, "Autosave period (minutes)").grid(row=2, column=0, sticky="w", pady=(0,4))
         self.var_auto = tk.StringVar(value=str(initial.get("autosave_minutes", 5)))
         e_auto = tk.Entry(frm, textvariable=self.var_auto, relief="flat",
-                          bg=c["surface"], fg=c["text"], insertbackground=c["text"])
+                          bg=c["surface"], fg=c["entry_fg"], insertbackground=c["entry_fg"])
         e_auto.grid(row=3, column=0, sticky="ew", padx=(0,6), pady=(0,10))
 
-        # ----- VAD aggressiveness -----
+        # VAD
         lab(frm, "VAD aggressiveness (0–3)").grid(row=4, column=0, sticky="w", pady=(0,4))
-        self.var_vad = tk.StringVar(value=str(initial.get("vad_aggr", 2)))
+        self.var_vad = tk.StringVar(value=str(initial.get("vad_aggr", 1)))
         e_vad = tk.Entry(frm, textvariable=self.var_vad, relief="flat",
-                         bg=c["surface"], fg=c["text"], insertbackground=c["text"])
+                         bg=c["surface"], fg=c["entry_fg"], insertbackground=c["entry_fg"])
         e_vad.grid(row=5, column=0, sticky="ew", padx=(0,6), pady=(0,10))
 
-        # ----- UI Scale -----
+        # UI scale
         lab(frm, "UI Scale (e.g., 1.00, 1.25)").grid(row=6, column=0, sticky="w", pady=(0,4))
         self.var_scale = tk.StringVar(value=str(initial.get("ui_scale", 1.0)))
         e_scale = tk.Entry(frm, textvariable=self.var_scale, relief="flat",
-                           bg=c["surface"], fg=c["text"], insertbackground=c["text"])
+                           bg=c["surface"], fg=c["entry_fg"], insertbackground=c["entry_fg"])
         e_scale.grid(row=7, column=0, sticky="ew", padx=(0,6), pady=(0,10))
 
         frm.grid_columnconfigure(0, weight=1)
 
-        # ---- buttons (separate frame; pack is OK here) ----
+        # Buttons
         btns = tk.Frame(self, bg=c["bg"])
         btns.pack(fill="x", padx=14, pady=(0,12))
 
@@ -2269,7 +2218,6 @@ class SettingsDialog(tk.Toplevel):
                 pass
 
         def _save_and_close():
-            # map label -> whisper code
             sel_label = self.var_lang_label.get()
             lang_code = _LABEL_TO_CODE.get(sel_label, "auto")
 
@@ -2294,7 +2242,7 @@ class SettingsDialog(tk.Toplevel):
                 return
 
             s = {
-                "language": lang_code,           # "ru", "uk", "pl", "en", "de", or "auto"
+                "language": lang_code,
                 "autosave_minutes": auto_m,
                 "vad_aggr": vad,
                 "ui_scale": scale,
@@ -2304,21 +2252,33 @@ class SettingsDialog(tk.Toplevel):
             finally:
                 self.destroy()
 
+        def _reset_widths():
+            if callable(self.on_reset_widths):
+                self.on_reset_widths()
+                messagebox.showinfo("Column widths", "Column widths have been reset to defaults.")
+            else:
+                messagebox.showwarning("Unavailable", "Reset action is not available.")
+
+        b_reset = tk.Button(btns, text="Reset column widths", command=_reset_widths)
+        _style_btn(b_reset)
+        b_reset.pack(side="left")
+
         b_ok = tk.Button(btns, text="Save", command=_save_and_close)
         b_cancel = tk.Button(btns, text="Cancel", command=self.destroy)
         _style_btn(b_ok); _style_btn(b_cancel)
         b_ok.pack(side="right", padx=(6,0))
         b_cancel.pack(side="right")
 
-
+        try:
+            enable_crisp_dark_mode(self, dark=True, delay_ms=0)
+        except Exception:
+            pass
 
 # ----------------------------
 # MAIN
 # ----------------------------
 if __name__ == "__main__":
-    # Load persisted settings, apply to globals first
     _apply_settings_to_globals(_read_settings_from_file())
-    # Rebuild VAD with possibly-updated aggressiveness
     _reinit_webrtc_vad()
 
     root = tk.Tk()
