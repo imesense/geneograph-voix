@@ -27,6 +27,7 @@ exe = EXE( # type: ignore
     a.datas,
     [],
     name='geneograph_voix',
+    exclude_binaries=True,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -40,4 +41,15 @@ exe = EXE( # type: ignore
     codesign_identity=None,
     entitlements_file=None,
     icon='NONE',
+)
+
+coll = COLLECT( # type: ignore
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='geneograph_voix',
 )
