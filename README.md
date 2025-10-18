@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Python 3
+- Python 3.10
 
 ## Build
 
@@ -11,7 +11,7 @@
 Configure virtual environment:
 
 ```powershell
-python -m venv .venv
+py -3.10 -m venv .venv
 .\.venv\Scripts\activate
 ```
 
@@ -20,6 +20,7 @@ Install dependencies:
 ```powershell
 pip install -r requirements.txt --cache-dir .pip
 pip install -r src\geneograph_voix\requirements.txt --cache-dir .pip
+pip install -r src\geneograph_voix\requirements_cuda.txt --cache-dir .pip
 ```
 
 Pack modules:
