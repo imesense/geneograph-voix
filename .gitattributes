@@ -2,6 +2,13 @@
 
 * text=auto
 
+# Shell scripts
+*.sh text eol=lf encoding=utf-8
+
+# Batch scripts
+*.bat text eol=crlf encoding=utf-8
+*.cmd text eol=crlf encoding=utf-8
+
 # Markdown documents
 *.md text eol=crlf encoding=utf-8
 
@@ -12,3 +19,25 @@
 .gitattributes text eol=lf encoding=utf-8
 .gitignore text eol=lf encoding=utf-8
 .mailmap text eol=lf encoding=utf-8
+
+# EditorConfig files
+.editorconfig text eol=crlf encoding=utf-8
+
+# Visual Studio files
+*.sln text eol=crlf encoding=utf-8-bom
+*.pyproj text eol=crlf encoding=utf-8
+
+# Visual Studio Code files
+*.code-workspace text eol=crlf encoding=utf-8
+.vscode/*.json text eol=crlf encoding=utf-8
+
+# DevContainers manifests
+.devcontainer/**/devcontainer.json text eol=lf encoding=utf-8
+
+# GitHub configs
+.github/CODEOWNERS text eol=lf encoding=utf-8
+.github/**/*.md text eol=lf encoding=utf-8
+.github/**/*.y*ml text eol=lf encoding=utf-8
+
+# Python files
+*.py text eol=crlf encoding=utf-8
