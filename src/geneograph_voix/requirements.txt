@@ -1,0 +1,7 @@
+faster-whisper==1.2.0
+numpy==2.3.4
+pandas==2.3.3
+sounddevice==0.5.2
+tksheet==7.5.16
+torch==2.9.0
+webrtcvad-wheels==2.0.14
