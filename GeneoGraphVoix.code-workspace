@@ -1,0 +1,24 @@
+{
+    "folders": [
+        {
+            "name": "GeneoGraph Voice Indexer",
+            "path": "."
+        }
+    ],
+
+    "settings": {
+        "files.associations": {
+            "*.py": "python",
+            "*.spec": "python",
+
+            "*.pyproj": "xml"
+        }
+    },
+
+    "extensions": {
+        "recommendations": [
+            "ms-python.python",
+            "DavidAnson.vscode-markdownlint"
+        ]
+    }
+}
