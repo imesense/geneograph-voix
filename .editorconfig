@@ -1,0 +1,102 @@
+# Enable top-most EditorConfig file
+root = true
+
+# Shell scripts
+[*.sh]
+charset = utf-8
+end_of_line = lf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+
+# Batch scripts
+[*.{bat,cmd}]
+charset = utf-8
+end_of_line = crlf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+
+# Markdown documents
+[*.md]
+charset = utf-8
+end_of_line = crlf
+indent_size = 2
+indent_style = space
+insert_final_newline = true
+
+# Text documents
+[*.txt]
+charset = utf-8
+end_of_line = crlf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+
+# Git configs
+[.{gitattributes,gitignore,mailmap}]
+charset = utf-8
+end_of_line = lf
+indent_style = tab
+insert_final_newline = true
+
+# EditorConfig files
+[.editorconfig]
+charset = utf-8
+end_of_line = crlf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+
+# Visual Studio files
+[*.sln]
+charset = utf-8-bom
+end_of_line = crlf
+indent_size = 4
+indent_style = tab
+insert_final_newline = true
+tab_width = 4
+
+# Visual Studio Code files
+[*.code-workspace]
+charset = utf-8
+end_of_line = crlf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+[.vscode/*.json]
+charset = utf-8
+end_of_line = crlf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+
+# DevContainers manifests
+[.devcontainer/**/devcontainer.json]
+charset = utf-8
+end_of_line = lf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+
+# GitHub configs
+[.github/CODEOWNERS]
+charset = utf-8
+end_of_line = lf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+[.github/**/*.{md,y*ml}]
+charset = utf-8
+end_of_line = lf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
+
+# Python files
+[*.py]
+charset = utf-8
+end_of_line = crlf
+indent_size = 4
+indent_style = space
+insert_final_newline = true
