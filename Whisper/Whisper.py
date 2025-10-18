@@ -39,12 +39,12 @@ AUTOSAVE_EVERY_MS = 5 * 60 * 1000   # 5 minutes
 USE_WEBRTC_VAD     = True   # enable/disable trimming (falls back gracefully if module missing)
 VAD_AGGRESSIVENESS = 1      # 0..3 (higher = stricter)
 VAD_FRAME_MS       = 20     # 10/20/30 ms
-VAD_HANG_MS        = 500    # ms of hangover after speech ends
-MIN_COMMIT_SEC     = 0.20   # skip decoding if trimmed speech is shorter than this
+VAD_HANG_MS        = 700    # ms of hangover after speech ends
+MIN_COMMIT_SEC     = 0.15   # skip decoding if trimmed speech is shorter than this
 
 # --- Silero VAD (preferred) ---
 USE_SILERO_VAD = True
-SILERO_THRESHOLD = 0.40            # 0..1, higher = stricter
+SILERO_THRESHOLD = 0.35            # 0..1, higher = stricter
 SILERO_MIN_SPEECH_MS = 100
 SILERO_MIN_SILENCE_MS = 200
 SILERO_PAD_MS = 300
@@ -683,7 +683,15 @@ def transcribe_buffer_commit(buffer):
         pass
 
     if use_trim and trimmed is None:
-        return ""
+        # second chance: if the raw buffer has energy, try untrimmed
+        try:
+            if not is_silence(mono, threshold_db=-50.0):
+                trimmed = mono
+            else:
+                return ""
+        except Exception:
+            return ""
+
     mono = trimmed
 
     if mono.shape[0] > 1:
@@ -1076,6 +1084,9 @@ class SpeechSheetApp:
         self._start_autosave()
 
         self._bind_toggle_hotkeys()
+        
+        self._last_preview_text = ""
+        self._last_preview_ts = 0.0
 
         # Buttons frame
         btn_frame = tk.Frame(root)
@@ -1648,6 +1659,9 @@ class SpeechSheetApp:
                     preview_text = ""
                 if preview_text:
                     preview_text = strip_trailing_dot(preview_text)
+                    now = time.monotonic()
+                    self._last_preview_text = preview_text
+                    self._last_preview_ts = now
                     self.root.after(0, lambda t=preview_text: self.preview_label.config(text="Preview: " + t))
 
             silence_tail = temp_buffer[-int(0.6 * SAMPLERATE):]
@@ -1656,6 +1670,18 @@ class SpeechSheetApp:
             if (silence_tail.shape[0] >= int(0.5 * SAMPLERATE) and is_silence(silence_tail)) or timeout:
                 full_text = transcribe_buffer_commit(temp_buffer)
                 full_text = strip_trailing_dot(full_text)
+                
+                if not full_text:
+                    recent_preview = (time.monotonic() - getattr(self, "_last_preview_ts", 0.0)) < 3.0
+                    if recent_preview and getattr(self, "_last_preview_text", ""):
+                        try:
+                            tail = temp_buffer[-int(1.5 * SAMPLERATE):]
+                            alt = transcribe_buffer(tail)
+                            alt = strip_trailing_dot(alt)
+                            if alt and not looks_like_outro(alt):
+                                full_text = alt
+                        except Exception:
+                            pass
 
                 try:
                     if full_text and looks_like_outro(full_text):
@@ -1665,7 +1691,7 @@ class SpeechSheetApp:
 
                 if full_text:
                     self.root.after(0, self.add_text_to_cell, full_text)
-                    self.root.after(0, lambda t=full_text: self.preview_label.config(text="🎤 Preview: " + t))
+                    self.root.after(0, lambda t=full_text: self.preview_label.config(text="Preview: " + t))
 
                 try:
                     if getattr(self, "_preview_clear_after", None):
