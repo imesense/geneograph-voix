@@ -3,3 +3,7 @@
 # System cache
 .DS_Store
 Thumbs.db
+
+# Visual Studio files
+.vs/
+*.user
