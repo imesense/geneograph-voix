@@ -1,5 +1,4 @@
-﻿# -*- coding: utf-8 -*-
-import threading
+﻿import threading
 import queue
 import time
 import os
@@ -8,44 +7,15 @@ import sys
 import re
 import warnings
 import unicodedata
+import torch
 import inspect
 
-# ----------------------------
-# 1) Put caches next to the EXE + enable mmap BEFORE importing torch/fw
-# ----------------------------
-if getattr(sys, "frozen", False):
-    APP_DIR = os.path.dirname(sys.executable)  # dist\geneograph_voix
-else:
-    APP_DIR = os.path.dirname(os.path.abspath(__file__))
-
-RUNTIME_CACHE = os.path.join(APP_DIR, "runtime_cache")
-HF_CACHE      = os.path.join(RUNTIME_CACHE, "hf_cache")
-TORCH_CACHE   = os.path.join(RUNTIME_CACHE, "torch_cache")
-os.makedirs(HF_CACHE, exist_ok=True)
-os.makedirs(TORCH_CACHE, exist_ok=True)
-
-# Hugging Face / CTranslate2
-os.environ.setdefault("HF_HOME", HF_CACHE)
-os.environ.setdefault("HUGGINGFACE_HUB_CACHE", HF_CACHE)
-os.environ.setdefault("CT2_USE_MMAP", "1")            # memory-map models
-os.environ.setdefault("CT2_PERSISTENT_CACHE", "1")    # speed up operator cache
-
-# Torch / TorchHub
-os.environ.setdefault("TORCH_HOME", TORCH_CACHE)
-os.environ.setdefault("TORCH_HUB", os.path.join(TORCH_CACHE, "hub"))
-os.environ.setdefault("TORCH_HUB_DISABLE_TELEMETRY", "1")
-os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
-
-# ----------------------------
-# Now import heavy deps
-# ----------------------------
 import tkinter as tk
 import numpy as np
 import pandas as pd
 import sounddevice as sd
-import torch
 
-from collections import namedtuple
+from collections import namedtuple, deque
 from contextlib import contextmanager
 from datetime import date
 from functools import lru_cache
@@ -54,31 +24,42 @@ from tkinter import filedialog, messagebox, simpledialog
 from tksheet import Sheet
 from faster_whisper import WhisperModel
 
-# ----------------------------
-# SETTINGS (cleaned; no WebRTC VAD)
-# ----------------------------
-MODEL_SIZE = "small"
-SAMPLERATE = 16000
-BLOCK_DURATION = 7               # seconds to force a commit if user speaks continuously
-COMPUTE_TYPE = "auto"            # "auto" for best effort (we resolve on first init)
-AUTOSAVE_EVERY_MS = 5 * 60 * 1000
-UI_SCALE = 1
-TABLE_ZOOM_PCT = 135
-PREVIEW_CLEAR_DELAY_MS = 1800
+# =========================================
+# Writable caches (helps PyInstaller one-folder)
+# =========================================
+def _prepare_frozen_caches():
+    try:
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+
+        cache_dir = os.path.join(base, "torch_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        os.environ.setdefault("TORCH_HOME", cache_dir)
+        os.environ.setdefault("HF_HOME", os.path.join(cache_dir, "huggingface"))
+
+        # Avoid symlink/hardlink operations that cause WinError 1314
+        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WINDOWS", "1")
+
+        # Runtime threading hints (only if user hasn't set them)
+        os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+        os.environ.setdefault("KMP_BLOCKTIME", "0")
+    except Exception:
+        pass
+
+_prepare_frozen_caches()
+
+# =========================================
+# Global config / settings
+# =========================================
 DATA_FILE = "records.csv"
 GLOSSARY_FILE = "glossary.json"
 SETTINGS_FILE = "settings.json"
-NAME_COLUMNS = {"Имя", "Фамилия", "Имя отца", "Имя матери", "Имя Матери"}
 
-# Silero VAD (preferred)
-USE_SILERO_VAD = True
-SILERO_THRESHOLD = 0.35
-SILERO_MIN_SPEECH_MS = 100
-SILERO_MIN_SILENCE_MS = 200
-SILERO_PAD_MS = 300
-MIN_COMMIT_SEC = 0.15  # minimal length of speech after trimming to attempt decoding
-
-# Whisper language dropdown (labels ↔ codes)
+# Language options
 WHISPER_LANG_CHOICES = [
     ("Auto (detect)", "auto"),
     ("Russian",   "ru"),
@@ -91,14 +72,56 @@ _LANG_LABELS = [lbl for (lbl, _) in WHISPER_LANG_CHOICES]
 _LABEL_TO_CODE = {lbl: code for (lbl, code) in WHISPER_LANG_CHOICES}
 _CODE_TO_LABEL = {code: lbl for (lbl, code) in WHISPER_LANG_CHOICES}
 
-# Male-name exceptions
-MALE_EXCEPTIONS = {
-    "акила","арефа","вавила","варнава","иеремия","иона","исая","иуда",
-    "калина","лука","осия","оссия","папа","фока","фома","никита",
-    "савва","илья","кузьма","мина","сила",
-}
+# Model picker: UI label ↔ key ↔ faster-whisper name
+MODEL_CHOICES = [
+    ("Base",     "base"),
+    ("Small",    "small"),
+    ("Medium",   "medium"),
+    ("Large V3", "large-v3"),
+    ("Turbo",    "turbo"),  # maps to large-v3-turbo
+]
+_MODEL_LABELS = [x[0] for x in MODEL_CHOICES]
+_LABEL_TO_MODELKEY = {lbl: key for (lbl, key) in MODEL_CHOICES}
+_MODELKEY_TO_LABEL = {key: lbl for (lbl, key) in MODEL_CHOICES}
 
-# Banned phrases / outros
+# Map model_key to actual checkpoint id
+def _model_id_for_key(model_key: str) -> str:
+    if model_key == "turbo":
+        return "large-v3-turbo"  # public id
+    return model_key
+
+# UI tuning
+UI_SCALE = 1.0
+TABLE_ZOOM_PCT = 135
+PREVIEW_CLEAR_DELAY_MS = 1800
+
+# Audio
+SAMPLERATE = 16000
+AUDIO_BLOCK_SEC = 0.10   # capture block size for low latency
+BLOCK_DURATION = 5       # seconds to force a commit if user speaks continuously
+
+# Silero VAD (only)
+SILERO_THRESHOLD = 0.40
+SILERO_MIN_SPEECH_MS = 120
+SILERO_MIN_SILENCE_MS = 250
+SILERO_PAD_MS = 250
+
+# Preview + speed knobs
+SPEED_MODE = False         # exposed in Settings
+PREVIEW_MIN_INTERVAL_SEC = 0.35
+PREVIEW_TAIL_SEC_DEFAULT = 0.60
+PREVIEW_TAIL_SEC_SPEED   = 0.50
+
+def _preview_tail_sec() -> float:
+    return PREVIEW_TAIL_SEC_SPEED if SPEED_MODE else PREVIEW_TAIL_SEC_DEFAULT
+
+# Autosave
+AUTOSAVE_EVERY_MS = 5 * 60 * 1000   # 5 minutes
+
+# Columns / cleaning
+NAME_COLUMNS = {"Имя", "Фамилия", "Имя отца", "Имя матери", "Имя Матери"}
+
+# Outro ban list
 BAN_PHRASES = tuple(s.lower() for s in (
     "Субтитры сделал DimaTorzok",
     "Субтитры создал DimaTorzok",
@@ -108,17 +131,174 @@ BAN_PHRASES = tuple(s.lower() for s in (
     "Dima Torzhok", "DimaTorzok", "DimaTorzhok",
     "Продолжение следует", "Субтитры",
     "Редактор субтитров А.Семкин Корректор А.Егорова",
-    "Редактор субтитров","Редактор"
+    "Редактор субтитров","Редактор", "Спасибо", "Thank you"
 ))
+MALE_EXCEPTIONS = {
+    "акила","арефа","вавила","варнава","иеремия","иона","исая","иуда",
+    "калина","лука","осия","оссия","папа","фока","фома","никита",
+    "савва","илья","кузьма","мина","сила",
+}
 
-# ----------------------------
-# AUDIO QUEUE
-# ----------------------------
+# =========================================
+# Devices, threading, compute types
+# =========================================
+warnings.filterwarnings("ignore")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def _detect_physical_cores() -> Optional[int]:
+    """Best-effort physical core count without requiring psutil."""
+    # 1) Try psutil via dynamic import (no Pylance warning; safe if missing)
+    try:
+        import importlib
+        psutil = importlib.import_module("psutil")  # optional dep
+        n = psutil.cpu_count(logical=False) or 0
+        if n > 0:
+            return int(n)
+    except Exception:
+        pass
+
+    # 2) Windows WMIC fallback
+    try:
+        if sys.platform.startswith("win"):
+            import subprocess
+            out = subprocess.check_output(["wmic", "cpu", "get", "NumberOfCores"], text=True)
+            nums = [int(x) for x in re.findall(r"\d+", out)]
+            if nums:
+                return sum(nums)
+    except Exception:
+        pass
+
+    # 3) Linux fallback via lscpu (counts unique core IDs)
+    try:
+        if sys.platform.startswith("linux"):
+            import subprocess
+            out = subprocess.check_output(["lscpu", "-p=Core"], text=True)
+            ids = set()
+            for line in out.splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                core_id = line.split(",")[0].strip()
+                if core_id:
+                    ids.add(core_id)
+            if ids:
+                return len(ids)
+    except Exception:
+        pass
+
+    # 4) Last resort: logical cores (not physical, but better than None)
+    try:
+        n = os.cpu_count()
+        return int(n) if n else None
+    except Exception:
+        return None
+
+CPU_THREADS: Optional[int] = None
+NUM_WORKERS: Optional[int] = None
+_physical = _detect_physical_cores()
+if _physical:
+    # Keep it modest to avoid starving UI
+    CPU_THREADS = max(2, min(_physical, 8))
+    NUM_WORKERS = 1
+    # Only set env if user didn't
+    os.environ.setdefault("OMP_NUM_THREADS", str(CPU_THREADS))
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+def _resolve_compute_type(device: str) -> Tuple[List[str], str]:
+    """
+    Returns (fallback_chain, initial_picked_string)
+    CPU: prefer int8 -> float32
+    CUDA: prefer float16 -> int8_float16 -> float32
+    """
+    env_ct = os.getenv("WHISPER_COMPUTE_TYPE") or os.getenv("FAST_WHISPER_COMPUTE_TYPE")
+    if env_ct:
+        return [env_ct], env_ct
+
+    if device == "cuda":
+        chain = ["float16", "int8_float16", "float32"]
+        return chain, chain[0]
+    else:
+        chain = ["int8", "float32"]
+        return chain, chain[0]
+
+# =========================================
+# Settings helpers
+# =========================================
+LANGUAGE = "ru"  # may be overridden by settings
+MODEL_KEY = None # decided from settings or default per device
+
+def _read_settings_from_file() -> dict:
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            if isinstance(s, dict):
+                return s
+    except Exception as e:
+        print("settings load error:", e)
+    return {}
+
+def _apply_settings_to_globals(s: dict):
+    global LANGUAGE, AUTOSAVE_EVERY_MS, UI_SCALE, MODEL_KEY, SPEED_MODE
+    try:
+        if "language" in s and isinstance(s["language"], str):
+            LANGUAGE = s["language"].strip() or "auto"
+        if "autosave_minutes" in s:
+            m = max(1, int(s["autosave_minutes"]))
+            AUTOSAVE_EVERY_MS = m * 60 * 1000
+        if "ui_scale" in s:
+            UI_SCALE = float(s["ui_scale"])
+        if "model_key" in s and s["model_key"] in _MODELKEY_TO_LABEL:
+            MODEL_KEY = s["model_key"]
+        if "speed_mode" in s:
+            SPEED_MODE = bool(s["speed_mode"])
+    except Exception as e:
+        print("settings apply error:", e)
+
+def _save_settings_file(s: dict):
+    try:
+        tmp = os.path.join(os.path.dirname(SETTINGS_FILE) or ".", "~settings.tmp.json")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SETTINGS_FILE)
+    except Exception as e:
+        print("settings save error:", e)
+
+# =========================================
+# Glossary + text utilities (unchanged core logic)
+# =========================================
+def _preview_is_banned(text: str) -> bool:
+    try:
+        return looks_like_outro(text)
+    except Exception:
+        t = (text or "").lower().replace("ё", "е")
+        t = re.sub(r"[^a-zа-я0-9\s]+", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        if "продолжение следует" in t:
+            return True
+        return any(p in t for p in BAN_PHRASES)
+
+def clean_person_field(text: str) -> str:
+    t = text or ""
+    t = re.sub(r"[^A-Za-zА-Яа-яЁё\-]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return ""
+    return " ".join(w[:1].upper() + w[1:].lower() if w else "" for w in t.split())
+
 audio_queue = queue.Queue()
 
 def audio_callback(indata, frames, time_info, status):
     if status:
         print("⚠️", status)
+    # Update last activity (silence guard): consider any incoming frame as activity
+    global LAST_ACTIVITY_TS
+    try:
+        x = np.asarray(indata, dtype=np.float32)
+        if x.size > 0:
+            if rms_db(x.flatten()) > -55.0:
+                LAST_ACTIVITY_TS = time.monotonic()
+    except Exception:
+        LAST_ACTIVITY_TS = time.monotonic()
     audio_queue.put(indata.copy())
 
 def rms_db(x: np.ndarray) -> float:
@@ -131,120 +311,46 @@ def rms_db(x: np.ndarray) -> float:
 def is_silence(buf: np.ndarray, threshold_db: float = -45.0) -> bool:
     return rms_db(buf.flatten()) < threshold_db
 
-# ----------------------------
-# Whisper lazy loader + version-safe transcribe
-# ----------------------------
-warnings.filterwarnings("ignore")
-
-_model = None
-_model_lock = threading.RLock()
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-def _resolve_compute_type(requested: str, dev: str) -> str:
-    env_ct = os.getenv("WHISPER_COMPUTE_TYPE") or os.getenv("FAST_WHISPER_COMPUTE_TYPE")
-    if env_ct:
-        return env_ct.strip()
-    if requested and requested.lower() != "auto":
-        return requested
-    return "int8_float16" if dev == "cuda" else "int8"
-
-def _fallback_chain(dev: str) -> List[str]:
-    return (["int8_float16", "float16", "float32"] if dev == "cuda"
-            else ["int8", "float32"])
-
-def ensure_whisper():
-    """Create WhisperModel on first use (lazy), with a safe compute_type fallback chain."""
-    global _model, COMPUTE_TYPE, device
-    if _model is not None:
-        return _model
-    with _model_lock:
-        if _model is not None:
-            return _model
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Loading Whisper model ({MODEL_SIZE}) on {device}...")
-        first = _resolve_compute_type(COMPUTE_TYPE or "auto", device)
-        candidates = [first] + [ct for ct in _fallback_chain(device) if ct != first]
-        last_err = None
-        for ct in candidates:
-            try:
-                _model = WhisperModel(
-                    MODEL_SIZE,
-                    device=device,
-                    compute_type=ct,
-                    download_root=HF_CACHE,
-                    num_workers=1,
-                )
-                COMPUTE_TYPE = ct
-                print(f"Whisper compute_type: {ct}")
-                break
-            except Exception as e:
-                print(f"compute_type '{ct}' not supported here -> {e}")
-                last_err = e
-        else:
-            raise last_err
-
-        if device == "cuda":
-            try:
-                print(f"[CUDA] device name: {torch.cuda.get_device_name(0)}")
-            except Exception:
-                pass
-        return _model
-
-def fw_transcribe(audio, **kwargs):
-    """
-    Version-safe wrapper around faster-whisper's WhisperModel.transcribe().
-    It filters out kwargs (like logprob_threshold, vad_filter, etc.) that
-    are not supported by the installed faster-whisper version to avoid:
-      TypeError: ... got an unexpected keyword argument 'logprob_threshold'
-    """
-    m = ensure_whisper()
-    params = inspect.signature(m.transcribe).parameters
-    safe = {k: v for k, v in kwargs.items() if k in params}
-    return m.transcribe(audio, **safe)
-
-# ----------------------------
-# Silero VAD (lazy)
-# ----------------------------
-_sil_lock = threading.RLock()
-_silero_model = None
-_get_speech_ts = None
+# ===========================
+# Silero VAD only
+# ===========================
 _has_silero = False
 _silero_device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def ensure_silero():
-    global _silero_model, _get_speech_ts, _has_silero, _silero_device
-    if not USE_SILERO_VAD:
+def _load_silero_vad():
+    global _has_silero, _silero_model, _get_speech_ts
+    try:
+        _silero_model, _silero_utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad',
+            trust_repo=True,
+            force_reload=False
+        )
+        (_get_speech_ts, *_rest) = _silero_utils
+        _silero_model.to(_silero_device)
+        _silero_model.eval()
+        # keep PyTorch from hogging CPU threads if VAD is on CPU
+        if _silero_device == "cpu":
+            try:
+                torch.set_num_threads(1)
+            except Exception:
+                pass
+        _has_silero = True
+        print(f"Silero VAD ready on {_silero_device}")
+    except Exception as e:
+        print("Silero VAD not available:", e)
         _has_silero = False
-        return False
-    if _silero_model is not None:
-        return True
-    with _sil_lock:
-        if _silero_model is not None:
-            return True
-        try:
-            torch.hub.set_dir(TORCH_CACHE)
-            _silero_model, silero_utils = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                trust_repo=True,
-                force_reload=False,
-            )
-            (_get_speech_ts, *_rest) = silero_utils
-            _silero_device = "cuda" if torch.cuda.is_available() else "cpu"
-            _silero_model.to(_silero_device)
-            _silero_model.eval()
-            _has_silero = True
-            print(f"Silero VAD ready on {_silero_device}")
-        except Exception as e:
-            print("Silero VAD not available:", e)
-            _has_silero = False
-        return _has_silero
 
 def _silero_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> Optional[np.ndarray]:
-    if not ensure_silero() or buf_f32 is None or getattr(buf_f32, "size", 0) == 0:
+    if not _has_silero or buf_f32 is None or getattr(buf_f32, "size", 0) == 0:
         return buf_f32
-    wav = torch.from_numpy(buf_f32).float().to(_silero_device)
+    # quick RMS pre-gate: if too silent, skip VAD entirely
+    try:
+        if rms_db(buf_f32) < -50.0:
+            return None
+    except Exception:
+        pass
+    wav = torch.from_numpy(buf_f32).float()
     ts = _get_speech_ts(
         wav, _silero_model,
         sampling_rate=sr,
@@ -257,13 +363,68 @@ def _silero_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> Optional[np.n
         return None
     start = ts[0]["start"]; end = ts[-1]["end"]
     trimmed = buf_f32[start:end]
-    if len(trimmed) < int(sr * MIN_COMMIT_SEC):
+    if len(trimmed) < int(sr * 0.15):
         return None
     return trimmed
 
-# ----------------------------
-# Outro/Ban detectors
-# ----------------------------
+# ===========================
+# Whisper model loading + wrapper
+# ===========================
+model: Optional[WhisperModel] = None
+COMPUTE_TYPE = None
+
+def _pick_default_model_key() -> str:
+    # CPU → small ; CUDA → turbo (large-v3-turbo)
+    return "turbo" if device == "cuda" else "small"
+
+def _load_whisper_model(model_key: str):
+    global model, COMPUTE_TYPE
+    model_id = _model_id_for_key(model_key)
+    chain, first = _resolve_compute_type(device)
+    last_err = None
+    for ct in chain:
+        try:
+            print(f"Loading Whisper model '{model_id}' on {device} with compute_type={ct} ...")
+            model = WhisperModel(model_id, device=device, compute_type=ct)
+            COMPUTE_TYPE = ct
+            print(f"Whisper ready: compute_type={ct}")
+            return
+        except Exception as e:
+            print(f"compute_type '{ct}' failed -> {e}")
+            last_err = e
+    raise last_err
+
+def _warmup_model():
+    try:
+        dummy = np.zeros((SAMPLERATE // 2,), dtype=np.float32)
+        list(fw_transcribe(dummy, beam_size=1, temperature=0.0, without_timestamps=True))
+    except Exception as e:
+        print("Warmup failed (non-fatal):", e)
+
+def fw_transcribe(audio, **kwargs):
+    """
+    Call faster-whisper's transcribe() with only supported kwargs.
+    Also inject auto threading args if available.
+    """
+    if CPU_THREADS is not None:
+        kwargs.setdefault("cpu_threads", CPU_THREADS)
+    if NUM_WORKERS is not None:
+        kwargs.setdefault("num_workers", NUM_WORKERS)
+
+    params = inspect.signature(model.transcribe).parameters
+    safe_kwargs = {k: v for k, v in kwargs.items() if k in params}
+    return model.transcribe(audio, **safe_kwargs)
+
+# ===========================
+# Language helpers + outro
+# ===========================
+def _effective_language():
+    if LANGUAGE is None:
+        return None
+    if isinstance(LANGUAGE, str) and LANGUAGE.strip().lower() in ("", "auto"):
+        return None
+    return LANGUAGE
+
 def _norm_text_basic(s: str) -> str:
     t = (s or "").lower()
     t = t.replace("ё", "е")
@@ -284,62 +445,139 @@ def looks_like_outro(s: str) -> bool:
         return True
     return False
 
-# ----------------------------
-# PREVIEW BAN CHECK
-# ----------------------------
-def _preview_is_banned(text: str) -> bool:
-    try:
-        return looks_like_outro(text)
-    except Exception:
-        t = (text or "").lower().replace("ё", "е")
-        t = re.sub(r"[^a-zа-я0-9\s]+", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
-        if "продолжение следует" in t:
-            return True
-        return any(p in t for p in BAN_PHRASES)
-
-# ----------------------------
-# PERSON FIELD CLEANUP
-# ----------------------------
-def clean_person_field(text: str) -> str:
-    t = text or ""
-    t = re.sub(r"[^A-Za-zА-Яа-яЁё\-]+", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    if not t:
+def strip_trailing_dot(text: str) -> str:
+    if text is None:
         return ""
-    return " ".join(w[:1].upper() + w[1:].lower() if w else "" for w in t.split())
+    s = str(text).rstrip()
+    while s.endswith(".") or s.endswith("…"):
+        s = s[:-1]
+    return s
 
-# ----------------------------
-# Settings helpers (cleaned; no VAD values)
-# ----------------------------
-def _read_settings_from_file() -> dict:
+# ===========================
+# Decoding functions (faster settings)
+# ===========================
+def transcribe_buffer(buffer):
+    if buffer.size == 0:
+        return ""
+    segments, _ = fw_transcribe(
+        buffer,
+        language=_effective_language(),
+        beam_size=1,
+        temperature=0.0,
+        without_timestamps=True,
+        condition_on_previous_text=False,
+        no_speech_threshold=0.75,
+        compression_ratio_threshold=2.3,
+    )
+    return " ".join((seg.text or "").strip() for seg in segments).strip()
+
+def transcribe_buffer_commit(buffer):
+    if buffer is None or buffer.size == 0:
+        return ""
+
+    mono = buffer[:, 0] if getattr(buffer, "ndim", 0) > 1 else buffer
+    mono = np.asarray(mono, dtype=np.float32, order="C")
+
+    # Trim with Silero if available (behind RMS pre-gate happens inside)
+    trimmed = mono
     try:
-        if os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                s = json.load(f)
-            if isinstance(s, dict):
-                return s
-    except Exception as e:
-        print("settings load error:", e)
-    return {}
+        if _has_silero:
+            t = _silero_vad_trim(mono)
+            if t is not None:
+                trimmed = t
+            else:
+                if not is_silence(mono, threshold_db=-50.0):
+                    trimmed = mono
+                else:
+                    return ""
+    except Exception:
+        pass
 
-def _apply_settings_to_globals(s: dict):
-    """Apply dict to module-level knobs (no UI side-effects here)."""
-    global LANGUAGE, AUTOSAVE_EVERY_MS, UI_SCALE
+    # simple pre-emphasis for clarity
+    if trimmed.shape[0] > 1:
+        x = trimmed.copy()
+        x[1:] = x[1:] - 0.97 * x[:-1]
+        trimmed = x
+
+    samples = trimmed.flatten()
+
+    # First pass (fast & strict)
+    segments, info = fw_transcribe(
+        samples,
+        language=_effective_language(),
+        beam_size=1,
+        temperature=0.0,
+        without_timestamps=True,
+        condition_on_previous_text=False,
+        no_speech_threshold=0.85,
+        compression_ratio_threshold=2.1,
+    )
+
+    segs = list(segments)
+    full_text = " ".join((s.text or "").strip() for s in segs).strip()
+
+    def _seg_suspicious(seg) -> bool:
+        try:
+            cr  = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
+            lp  = float(getattr(seg, "avg_logprob", -10.0) or -10.0)
+            nsp = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
+            return (cr > 2.2) or (lp < -0.5 and nsp > 0.5)
+        except Exception:
+            return False
+
+    suspicious = False
+    if full_text and looks_like_outro(full_text):
+        suspicious = True
+    elif not full_text:
+        suspicious = True
+    else:
+        bad_flags = [_seg_suspicious(sg) for sg in segs] if segs else []
+        if bad_flags and (sum(bad_flags) >= max(1, len(bad_flags)//2) or bad_flags[-1]):
+            suspicious = True
+
+    # In SPEED_MODE, skip the retry pass entirely to save time
+    if suspicious and not SPEED_MODE:
+        # Retry with slightly relaxed thresholds
+        segments2, info2 = fw_transcribe(
+            samples,
+            language=_effective_language(),
+            beam_size=1,
+            temperature=0.0,
+            without_timestamps=True,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.90,
+            compression_ratio_threshold=2.0,
+        )
+        segs2 = list(segments2)
+        alt = " ".join((s.text or "").strip() for s in segs2).strip()
+
+        def _seg_suspicious_retry(seg) -> bool:
+            try:
+                cr  = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
+                lp  = float(getattr(seg, "avg_logprob", -10.0) or -10.0)
+                nsp = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
+                return (cr > 2.0) or (lp < -0.35 and nsp > 0.60)
+            except Exception:
+                return False
+
+        bad2 = [_seg_suspicious_retry(sg) for sg in segs2] if segs2 else []
+        looks_outro = bool(alt and looks_like_outro(alt))
+        metrics_bad = bool(bad2 and (sum(bad2) >= max(1, len(bad2)//2) or bad2[-1]))
+        if (not alt) or looks_outro or metrics_bad:
+            return ""
+        full_text = alt
+    elif suspicious and SPEED_MODE:
+        return ""
+
     try:
-        if "language" in s and isinstance(s["language"], str) and s["language"].strip():
-            LANGUAGE = s["language"].strip()
-        if "autosave_minutes" in s:
-            m = int(s["autosave_minutes"])
-            AUTOSAVE_EVERY_MS = max(1, m) * 60 * 1000
-        if "ui_scale" in s:
-            UI_SCALE = float(s["ui_scale"])
-    except Exception as e:
-        print("settings apply error:", e)
+        full_text = strip_trailing_dot(full_text)
+    except Exception:
+        pass
+    return full_text
 
-# ----------------------------
-# Glossary & correction engine (unchanged)
-# ----------------------------
+# ===========================
+# Glossary correction (full logic retained)
+# ===========================
 GLOSSARIES = {}
 GLOSSARY_VER = 0
 BEST_CACHE_SINGLE: dict[tuple[str, str, int], tuple[Optional["_Best"], Optional["_Best"]]] = {}
@@ -390,7 +628,6 @@ CONFUSION_CLASSES = [
     set("бп"), set("вф"), set("гкх"), set("дт"), set("зсц"),
     set("жшщч"),
 ]
-
 KEYBOARD_NEIGHBORS_RU: dict[str, set[str]] = {}
 VOWELS_RU = set("аеёиоуыэюяіїеaeiouy")
 
@@ -469,13 +706,11 @@ def _wdl(a: str, b: str) -> float:
     n, m = len(a), len(b)
     if n == 0: return float(m)
     if m == 0: return float(n)
-
     dp = [[0.0]*(m+1) for _ in range(n+1)]
     for i in range(1, n+1):
         dp[i][0] = i * _WDL_DEL_COST
     for j in range(1, m+1):
         dp[0][j] = j * _WDL_INS_COST
-
     for i in range(1, n+1):
         ai = a[i-1]
         for j in range(1, m+1):
@@ -484,7 +719,6 @@ def _wdl(a: str, b: str) -> float:
             ins = dp[i][j-1] + _WDL_INS_COST
             dele= dp[i-1][j] + _WDL_DEL_COST
             best = sub if sub <= ins and sub <= dele else (ins if ins <= dele else dele)
-
             if i >= 2 and j >= 2 and a[i-1] == b[j-2] and a[i-2] == b[j-1]:
                 swap = dp[i-2][j-2] + _WDL_SWAP_COST
                 if swap < best:
@@ -532,9 +766,7 @@ def _lev(a: str, b: str) -> int:
         for j in range(1, m+1):
             cb = b[j-1]
             cost = 0 if ca == cb else 1
-            cur[j] = min(prev[j] + 1,      # deletion
-                         cur[j-1] + 1,      # insertion
-                         prev[j-1] + cost)  # substitution
+            cur[j] = min(prev[j] + 1, cur[j-1] + 1, prev[j-1] + cost)
         prev = cur
     return prev[m]
 
@@ -571,17 +803,14 @@ BRIDGE_WORDS = {"в", "во", "и", "й", "а"}
 def _best_two_candidates(a_norm: str, g_norm: list[tuple[str, str]]) -> tuple[Optional[_Best], Optional[_Best]]:
     if not a_norm:
         return None, None
-
     best: Optional[_Best] = None
     second: Optional[_Best] = None
-
     first = a_norm[0] if a_norm else ""
     last  = a_norm[-1] if a_norm else ""
     use_coarse = len(a_norm) >= 5
 
     def _edge_ok(a_ch: str, b_ch: str) -> bool:
-        if not a_ch or not b_ch:
-            return False
+        if not a_ch or not b_ch: return False
         return a_ch == b_ch or _same_confusion_class(a_ch, b_ch)
 
     for orig, b in g_norm:
@@ -589,35 +818,28 @@ def _best_two_candidates(a_norm: str, g_norm: list[tuple[str, str]]) -> tuple[Op
             continue
         if use_coarse and not (_edge_ok(first, b[0]) or _edge_ok(last, b[-1])):
             continue
-
         d_lev = _lev(a_norm, b)
         L = max(len(a_norm), len(b))
         if d_lev > _len_aware_max_edits(L):
             wdl_soft = _wdl(a_norm, b)
             if wdl_soft > _len_aware_max_edits(L) + 0.5:
                 continue
-
         dice = _dice_sim(a_norm, b)
         lcp  = _lcp_len(a_norm, b)
         lcs  = _lcs_len(a_norm, b)
         wdl  = _wdl(a_norm, b)
         phon = _wdl(ru_phon_key(a_norm), ru_phon_key(b))
-
         cand = _Best(orig=orig, norm=b, d=d_lev, dice=dice, lcp=lcp, lcs=lcs, wdl=wdl, phon=phon)
 
         def better(x: _Best, y: _Best) -> bool:
-            if x.wdl != y.wdl:
-                return x.wdl < y.wdl
-            if x.dice != y.dice:
-                return x.dice > y.dice
+            if x.wdl != y.wdl: return x.wdl < y.wdl
+            if x.dice != y.dice: return x.dice > y.dice
             return max(x.lcp, x.lcs) > max(y.lcp, y.lcs)
 
         if best is None or better(cand, best):
-            second = best
-            best = cand
+            second = best; best = cand
         elif second is None or better(cand, second):
             second = cand
-
     return best, second
 
 def _best_two_cached(header: str, a_norm: str, g_norm: list[tuple[str, str]], *, is_merge: bool) -> tuple[Optional[_Best], Optional[_Best]]:
@@ -644,13 +866,9 @@ def _should_correct_from_norm(a_norm: str, best: Optional[_Best], runner_up: Opt
 
     if dice < min_d and phon <= 1.0:
         min_d -= 0.07
-
-    if wdl > max_ed:
-        return False
-    if dice < min_d:
-        return False
-    if anchor < req_anchor:
-        return False
+    if wdl > max_ed: return False
+    if dice < min_d: return False
+    if anchor < req_anchor: return False
 
     if runner_up is None:
         return True
@@ -706,7 +924,6 @@ def correct_text_for_column(text: str, header: str) -> str:
         if i + 2 < len(tokens):
             tok2 = tokens[i + 1]
             tok3 = tokens[i + 2]
-
             joined123 = tok + tok2 + tok3
             a_join123 = _ru_norm_merge(joined123)
             if a_join123:
@@ -714,9 +931,8 @@ def correct_text_for_column(text: str, header: str) -> str:
                 if _should_correct_from_norm(a_join123, bestm3a, runnerm3a):
                     if len(a_join123) >= 6 and (bestm3a.lcp >= 3 or bestm3a.lcs >= 3):
                         cand3 = (bestm3a, _score_from_norm(a_join123, bestm3a))
-
             tok2_clean = _ru_norm(tok2)
-            if tok2_clean in BRIDGE_WORDS:
+            if tok2_clean in {"в","во","и","й","а"}:
                 joined13 = tok + tok3
                 a_join13 = _ru_norm_merge(joined13)
                 if a_join13:
@@ -741,7 +957,6 @@ def correct_text_for_column(text: str, header: str) -> str:
                     ok2 = _should_correct(tokens[i + 1], best2, runner2)
                     if ok2 and best2:
                         score2 = _score_from_norm(a2, best2)
-
             score_m = best_merge[1]
             if (not ok1 and not ok2) or (score_m + 0.30 <= min(score1, score2)):
                 out.append(best_merge[0].orig)
@@ -756,14 +971,11 @@ def correct_text_for_column(text: str, header: str) -> str:
                 out.append(tok)
         else:
             out.append(tok)
-
         i += 1
 
     return " ".join(out)
 
-# ----------------------------
-# Date normalization
-# ----------------------------
+# Dates
 RU_MONTHS = {
     "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
     "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
@@ -774,7 +986,6 @@ def _clean_spaces(s: str) -> str:
 
 def normalize_date(text: str) -> Optional[str]:
     t = (_clean_spaces(text or "")).lower()
-
     m = re.search(r"\b(\d{1,2})[.\-\/](\d{1,2})[.\-\/](\d{2,4})\b", t)
     if m:
         d, mth, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -783,13 +994,11 @@ def normalize_date(text: str) -> Optional[str]:
             return f"{date(y, mth, d):%d.%m.%Y}"
         except ValueError:
             return None
-
     m2 = re.search(r"\b(\d{1,2})\s+([а-яё]+)(?:\s+(\d{2,4}))?\b", t)
     if m2:
         mon = m2.group(2)
         if mon in RU_MONTHS:
-            d = int(m2.group(1))
-            mth = RU_MONTHS[mon]
+            d = int(m2.group(1)); mth = RU_MONTHS[mon]
             y = m2.group(3)
             if y is None:
                 y = date.today().year
@@ -799,147 +1008,11 @@ def normalize_date(text: str) -> Optional[str]:
                 return f"{date(y, mth, d):%d.%m.%Y}"
             except ValueError:
                 return None
-
     return None
 
-def strip_trailing_dot(text: str) -> str:
-    if text is None:
-        return ""
-    s = str(text).rstrip()
-    while s.endswith(".") or s.endswith("…"):
-        s = s[:-1]
-    return s
-
-# ----------------------------
-# TRANSCRIBE FUNCTIONS
-# ----------------------------
-def _effective_language():
-    if LANGUAGE is None:
-        return None
-    if isinstance(LANGUAGE, str) and LANGUAGE.strip().lower() in ("", "auto"):
-        return None
-    return LANGUAGE
-
-def transcribe_buffer(buffer):
-    if buffer.size == 0:
-        return ""
-    segments, _ = fw_transcribe(
-        buffer,
-        language=_effective_language(),
-        beam_size=5,
-        # IMPORTANT: no internal fast-whisper VAD (avoids onnxruntime in EXE)
-        no_speech_threshold=0.7,
-        compression_ratio_threshold=2.4,
-        condition_on_previous_text=False,
-    )
-    return " ".join((seg.text or "").strip() for seg in segments).strip()
-
-def transcribe_buffer_commit(buffer):
-    if buffer is None or buffer.size == 0:
-        return ""
-
-    mono = buffer[:, 0] if getattr(buffer, "ndim", 0) > 1 else buffer
-    mono = np.asarray(mono, dtype=np.float32, order="C")
-
-    # Trim with Silero if available
-    trimmed = mono
-    try:
-        if USE_SILERO_VAD and ensure_silero():
-            t = _silero_vad_trim(mono)
-            if t is not None:
-                trimmed = t
-            else:
-                # if VAD says "no speech", double-check it's not just quiet
-                if is_silence(mono, threshold_db=-50.0):
-                    return ""
-    except Exception:
-        pass
-
-    mono = trimmed
-    if mono.shape[0] > 1:
-        mono = mono.copy()
-        mono[1:] = mono[1:] - 0.97 * mono[:-1]  # simple preemphasis
-
-    samples = mono.flatten()
-
-    # primary decode (stable)
-    segments, info = fw_transcribe(
-        samples,
-        language=_effective_language(),
-        beam_size=5,
-        temperature=0.0,
-        without_timestamps=True,
-        condition_on_previous_text=False,
-        no_speech_threshold=0.85,
-        compression_ratio_threshold=2.2,
-        suppress_blank=True,  # filtered out if not supported
-        initial_prompt="Диктовка для таблицы: имена, фамилии, даты. Не писать титры или подписи.",
-    )
-
-    segs = list(segments)
-    full_text = " ".join((s.text or "").strip() for s in segs).strip()
-
-    def _seg_suspicious(seg) -> bool:
-        try:
-            cr  = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
-            lp  = float(getattr(seg, "avg_logprob", -10.0) or -10.0)
-            nsp = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
-            return (cr > 2.2) or (lp < -0.5 and nsp > 0.50)
-        except Exception:
-            return False
-
-    bad_flags = [_seg_suspicious(sg) for sg in segs] if segs else []
-    reason = None
-    suspicious = False
-
-    if full_text and looks_like_outro(full_text):
-        suspicious = True; reason = "banlist"
-    elif not full_text:
-        suspicious = True; reason = "empty"
-    elif bad_flags and (sum(bad_flags) >= max(1, len(bad_flags)//2) or bad_flags[-1]):
-        suspicious = True; reason = "metrics"
-
-    # retry with a simpler beam if suspicious (still no internal VAD / logprob args)
-    if suspicious:
-        segments2, info2 = fw_transcribe(
-            samples,
-            language=_effective_language(),
-            beam_size=1,
-            temperature=0.0,
-            without_timestamps=True,
-            condition_on_previous_text=False,
-            no_speech_threshold=0.90,
-            compression_ratio_threshold=2.0,
-            suppress_blank=True,
-        )
-        segs2 = list(segments2)
-        alt = " ".join((s.text or "").strip() for s in segs2).strip()
-
-        def _seg_suspicious_retry(seg) -> bool:
-            try:
-                cr  = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
-                lp  = float(getattr(seg, "avg_logprob", -10.0) or -10.0)
-                nsp = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
-                return (cr > 2.0) or (lp < -0.35 and nsp > 0.60)
-            except Exception:
-                return False
-
-        bad_flags2 = [_seg_suspicious_retry(sg) for sg in segs2] if segs2 else []
-        looks_outro = bool(alt and looks_like_outro(alt))
-        metrics_bad = bool(bad_flags2 and (sum(bad_flags2) >= max(1, len(bad_flags2)//2) or bad_flags2[-1]))
-        if (not alt) or looks_outro or metrics_bad:
-            return ""
-        full_text = alt
-
-    try:
-        full_text = strip_trailing_dot(full_text)
-    except Exception:
-        pass
-    return full_text
-
-# ----------------------------
-# HiDPI & Dark Theme
-# ----------------------------
+# ===========================
+# UI theming
+# ===========================
 try:
     from tkinter import ttk
     import tkinter.font as tkfont
@@ -1108,19 +1181,11 @@ def _style_ttk(dark=True):
         pass
 
     c = _gfm_palette(dark)
-
     style.configure(".", background=c["bg"], foreground=c["text"])
     style.configure("TFrame", background=c["bg"])
     style.configure("TLabel", background=c["bg"], foreground=c["text"])
-
-    style.configure("TEntry",
-                    fieldbackground=c["surface"],
-                    foreground=c["entry_fg"],
-                    bordercolor=c["border"])
-    style.map("TEntry",
-              fieldbackground=[("disabled", c["button_disabled_bg"])],
-              foreground=[("disabled", c["button_disabled_fg"])])
-
+    style.configure("TEntry", fieldbackground=c["surface"], foreground=c["entry_fg"], bordercolor=c["border"])
+    style.map("TEntry", fieldbackground=[("disabled", c["button_disabled_bg"])], foreground=[("disabled", c["button_disabled_fg"])])
     style.configure(
         "Settings.TCombobox",
         background=c["surface"],
@@ -1147,10 +1212,8 @@ def _try_style_tksheet(root: "tk.Tk", dark=True):
     except Exception:
         return
     colors = _gfm_palette(dark)
-
     def _sz(px):
         return max(8, int(round(px * UI_SCALE)))
-
     def walk(w):
         for c in w.winfo_children():
             try:
@@ -1193,9 +1256,9 @@ def enable_crisp_dark_mode(root: "tk.Tk", dark=True, delay_ms=350):
     except Exception:
         _apply_dark_ui(root, dark=dark)
 
-# ----------------------------
-# GUI APP
-# ----------------------------
+# ===========================
+# GUI Application
+# ===========================
 class SpeechSheetApp:
     def __init__(self, root):
         self.root = root
@@ -1209,9 +1272,10 @@ class SpeechSheetApp:
         self._bind_toggle_hotkeys()
         self._last_preview_text = ""
         self._last_preview_ts = 0.0
+        self._last_preview_decode_ts = 0.0
         self._settings_applying = False
 
-        # Buttons
+        # Buttons frame
         btn_frame = tk.Frame(root)
         btn_frame.grid(row=0, column=0, sticky="ew", padx=5, pady=5)
 
@@ -1224,7 +1288,7 @@ class SpeechSheetApp:
         self.export_btn = tk.Button(btn_frame, text="💾 Export", command=self.export_data)
         self.export_btn.grid(row=0, column=2, padx=5)
 
-        self.add_row_btn = tk.Button(btn_frame, text="➕ Add Row", command=self.add_row)
+        self.add_row_btn = tk.Button(btn_frame, text="➕ Add Rows", command=lambda: self.add_rows(100))
         self.add_row_btn.grid(row=0, column=3, padx=5)
 
         self.clear_btn = tk.Button(btn_frame, text="🧹 Clear All", command=self.clear_all_cells)
@@ -1257,6 +1321,7 @@ class SpeechSheetApp:
 
         self.sheet = Sheet(root, headers=self.headers, height=400, width=1000, zoom=TABLE_ZOOM_PCT)
 
+        # Column widths
         try:
             self.load_column_widths()
         except Exception as e:
@@ -1281,13 +1346,30 @@ class SpeechSheetApp:
         # Data
         self.load_data()
 
-        # Audio buffer
+        # Audio state
         self.buffer = np.zeros((0,1), dtype=np.float32)
+        self._tail_chunks: deque[np.ndarray] = deque()
+        self._tail_total_samples: int = 0
+        self._commit_chunks: list[np.ndarray] = []
+        self._commit_total_samples: int = 0
 
-        # Close event
+        # Safety net timer
+        self._silence_guard_job = None
+        self._start_silence_guard()
+
+        # Handle close event
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # ------- small helper: transient preview note -------
+        # Info line
+        try:
+            print(f"[Devices] Whisper device={device}; compute_type={COMPUTE_TYPE}; "
+                  f"Silero device={_silero_device}; torch.cuda={torch.cuda.is_available()}")
+            if torch.cuda.is_available():
+                print("[CUDA] device name:", torch.cuda.get_device_name(0))
+        except Exception as _e:
+            print("Device log error:", _e)
+
+    # ------- Preview flash -------
     def _flash_preview_note(self, msg: str, ms: int = 1200):
         try:
             old = self.preview_label.cget("text")
@@ -1301,9 +1383,7 @@ class SpeechSheetApp:
         except Exception:
             pass
 
-    # ----------------------------
-    # Column width helpers
-    # ----------------------------
+    # Column widths helpers
     def _snapshot_column_widths(self):
         try:
             if hasattr(self.sheet, "get_column_widths"):
@@ -1345,9 +1425,7 @@ class SpeechSheetApp:
                 except Exception as e:
                     print("restore widths error:", e)
 
-    # ----------------------------
-    # SHEET HELPERS
-    # ----------------------------
+    # Sheet ops
     def _get_sheet_data_copy(self):
         try:
             return self.sheet.get_sheet_data(return_copy=True)
@@ -1355,10 +1433,13 @@ class SpeechSheetApp:
             data = self.sheet.get_sheet_data()
             return [list(row) for row in data]
 
-    def add_row(self):
+    def add_rows(self, count: int = 1):
+        if count <= 0:
+            return
         with self.preserve_column_widths():
             data = self._get_sheet_data_copy()
-            data.append([""] * len(self.headers))
+            ncols = len(self.headers)
+            data.extend([[""] * ncols for _ in range(count)])
             self.sheet.set_sheet_data(data)
 
     def clear_all_cells(self):
@@ -1454,7 +1535,6 @@ class SpeechSheetApp:
         header = self.headers[col]
 
         raw = (text or "").strip()
-
         if header == "Дата":
             value = normalize_date(raw)
             if value is None:
@@ -1466,7 +1546,6 @@ class SpeechSheetApp:
             return
 
         raw = correct_text_for_column(raw, header)
-
         if header in NAME_COLUMNS:
             raw = clean_person_field(raw)
 
@@ -1479,9 +1558,7 @@ class SpeechSheetApp:
         except Exception:
             pass
 
-    # ----------------------------
     # Autosave
-    # ----------------------------
     def _start_autosave(self):
         try:
             if self._autosave_job:
@@ -1508,9 +1585,7 @@ class SpeechSheetApp:
         except Exception:
             pass
 
-    # ----------------------------
-    # Gender helpers & auto numbering
-    # ----------------------------
+    # Name helpers (for auto-numerate)
     def _ru_norm_name(self, s: str) -> str:
         if not s:
             return ""
@@ -1577,20 +1652,15 @@ class SpeechSheetApp:
         try: self.root.bell()
         except Exception: pass
 
-    # ----------------------------
     # Hotkeys
-    # ----------------------------
     def _bind_toggle_hotkeys(self):
-        """F1 toggles start/stop; Esc stops. Safe around text editing widgets."""
         self._hotkey_cooldown_until = 0.0
-
         def _cooldown_ok():
             now = time.monotonic()
             if now < self._hotkey_cooldown_until:
                 return False
             self._hotkey_cooldown_until = now + 0.25
             return True
-
         def _in_text_edit():
             w = self.root.focus_get()
             if w is None:
@@ -1600,7 +1670,6 @@ class SpeechSheetApp:
             except Exception:
                 cls = ""
             return isinstance(w, (tk.Entry, tk.Text)) or "entry" in cls or "text" in cls
-
         def toggle_evt(_=None):
             if _in_text_edit():
                 self._flash_preview_note("⚠ Горячая клавиша отключена во время редактирования ячейки")
@@ -1613,13 +1682,11 @@ class SpeechSheetApp:
                 self.stop_listening()
             else:
                 self.start_listening()
-
         def stop_evt(_=None):
             if not _cooldown_ok():
                 return
             if self.is_listening:
                 self.stop_listening()
-
         self.root.bind_all("<F1>", toggle_evt, add="+")
         for seq in ("<Escape>", "<KeyPress-Escape>"):
             self.root.bind_all(seq, stop_evt, add="+")
@@ -1629,16 +1696,9 @@ class SpeechSheetApp:
             "language": LANGUAGE if LANGUAGE else "auto",
             "autosave_minutes": max(1, AUTOSAVE_EVERY_MS // 60000),
             "ui_scale": UI_SCALE,
+            "model_key": MODEL_KEY or _pick_default_model_key(),
+            "speed_mode": SPEED_MODE,
         }
-
-    def _save_settings_file(self, s: dict):
-        try:
-            tmp = os.path.join(os.path.dirname(SETTINGS_FILE) or ".", "~settings.tmp.json")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(s, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, SETTINGS_FILE)
-        except Exception as e:
-            print("settings save error:", e)
 
     def _refresh_preview_font(self):
         try:
@@ -1668,20 +1728,42 @@ class SpeechSheetApp:
         prev = self._current_settings()
         self._settings_applying = True
         try:
-            _apply_settings_to_globals(s)
-            self._save_settings_file(self._current_settings())
+            # Determine if model switch is requested
+            requested_model_key = s.get("model_key", prev["model_key"])
+            model_changed = (requested_model_key != prev["model_key"])
 
-            ui_scale_changed = float(prev.get("ui_scale", 1.0)) != float(s.get("ui_scale", prev.get("ui_scale", 1.0)))
-            if ui_scale_changed:
+            # Save globals
+            _apply_settings_to_globals(s)
+            _save_settings_file(self._current_settings())
+
+            # UI scale changes
+            if float(prev.get("ui_scale", 1.0)) != float(s.get("ui_scale", prev.get("ui_scale", 1.0))):
                 _apply_dark_ui(self.root, dark=True)
                 self._refresh_preview_font()
                 self._maybe_update_sheet_zoom()
                 self._style_action_buttons()
+
+            # Speed mode might change preview tail; no reload needed
+
+            # If listening and model changed, stop recording before reload
+            if model_changed:
+                if self.is_listening:
+                    self.stop_listening()
+                self._show_loading("Loading model, please wait…")
+                try:
+                    _load_whisper_model(MODEL_KEY)
+                    _warmup_model()
+                finally:
+                    self._hide_loading()
+
+            self._start_autosave()
         except Exception as e:
             print("apply_settings error:", e)
+            messagebox.showerror("Settings", f"Failed to apply settings:\n{e}")
         finally:
             self._settings_applying = False
 
+    # Settings dialog
     def open_settings(self):
         SettingsDialog(
             self.root,
@@ -1690,83 +1772,20 @@ class SpeechSheetApp:
             on_reset_widths=self.reset_column_widths,
         )
 
-    # ----------------------------
-    # AUDIO RESET
-    # ----------------------------
-    def reset_audio_state(self):
-        global audio_queue
-        try:
-            while not audio_queue.empty():
-                audio_queue.get_nowait()
-        except Exception:
-            pass
-        self.buffer = np.zeros((0,1), dtype=np.float32)
-        try:
-            self.preview_label.config(text="Preview:")
-        except Exception:
-            pass
-
-    # ----------------------------
-    # WINDOWS CONSOLE AUTO-CLOSE
-    # ----------------------------
-    def _detach_console_if_any(self):
-        if sys.platform.startswith("win"):
-            try:
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                if kernel32.GetConsoleWindow():
-                    kernel32.FreeConsole()
-            except Exception:
-                pass
-
-    # ----------------------------
-    # ACTION BUTTON STYLING
-    # ----------------------------
-    def _style_action_buttons(self):
-        START_BG  = "#2e7d32"
-        START_BG_H= "#2b7030"
-        STOP_BG   = "#c62828"
-        STOP_BG_H = "#b12525"
-        TXT_LIGHT = "#ffffff"
-
-        def apply(btn, *, bg, bg_h, fg, disabled: bool):
-            if disabled:
-                btn.configure(
-                    bg="#3a4352", fg="#9aa5b1",
-                    activebackground="#3a4352", activeforeground="#9aa5b1"
-                )
-            else:
-                btn.configure(
-                    bg=bg, fg=fg,
-                    activebackground=bg_h, activeforeground=fg,
-                    highlightthickness=1
-                )
-
-        try:
-            apply(
-                self.start_btn,
-                bg=START_BG, bg_h=START_BG_H, fg=TXT_LIGHT,
-                disabled=(str(self.start_btn.cget("state")) == "disabled")
-            )
-            apply(
-                self.stop_btn,
-                bg=STOP_BG, bg_h=STOP_BG_H, fg=TXT_LIGHT,
-                disabled=(str(self.stop_btn.cget("state")) == "disabled")
-            )
-        except Exception:
-            pass
-
-    # ----------------------------
-    # LISTENING
-    # ----------------------------
+    # Listening
     def start_listening(self):
-        # Lazy init heavy models here so the UI appears instantly
-        t0 = time.time()
-        ensure_whisper()
-        ensure_silero()
-        print(f"[Init] models ready in {time.time()-t0:.2f}s")
-
+        global LAST_ACTIVITY_TS
         self.reset_audio_state()
+        LAST_ACTIVITY_TS = time.monotonic()
+        self._listening_started_ts = LAST_ACTIVITY_TS
+
+        # reset rolling structures
+        self._tail_chunks.clear()
+        self._tail_total_samples = 0
+        self._commit_chunks.clear()
+        self._commit_total_samples = 0
+        self._last_preview_decode_ts = 0.0
+
         self.is_listening = True
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
@@ -1782,43 +1801,119 @@ class SpeechSheetApp:
         self._style_action_buttons()
 
     def audio_capture_thread(self):
+        bs = int(SAMPLERATE * AUDIO_BLOCK_SEC)
+        if bs < 256:
+            bs = 256
         with sd.InputStream(samplerate=SAMPLERATE, channels=1, dtype='float32',
-                            blocksize=int(SAMPLERATE * 0.2), callback=audio_callback):
+                            blocksize=bs, latency='low', callback=audio_callback):
             while self.is_listening:
                 sd.sleep(100)
 
+    def _tail_limit_samples(self) -> int:
+        return int(_preview_tail_sec() * SAMPLERATE)
+
+    def _push_tail(self, mono_1d: np.ndarray):
+        """Append to rolling tail (deque of 1D float32 chunks) and enforce length."""
+        if mono_1d.size == 0:
+            return
+        self._tail_chunks.append(mono_1d)
+        self._tail_total_samples += mono_1d.shape[0]
+        limit = self._tail_limit_samples()
+        # trim from the left if we exceed the limit
+        while self._tail_total_samples > limit and self._tail_chunks:
+            excess = self._tail_total_samples - limit
+            left = self._tail_chunks[0]
+            if left.shape[0] <= excess:
+                self._tail_total_samples -= left.shape[0]
+                self._tail_chunks.popleft()
+            else:
+                # split the left chunk, drop only the needed prefix
+                remain = left[excess:].copy()
+                self._tail_chunks[0] = remain
+                self._tail_total_samples -= excess
+                break
+
+    def _concat_tail(self) -> np.ndarray:
+        if not self._tail_chunks:
+            return np.zeros((0,), dtype=np.float32)
+        if len(self._tail_chunks) == 1:
+            return self._tail_chunks[0]
+        return np.concatenate(list(self._tail_chunks), axis=0)
+
     def transcribe_thread(self):
-        temp_buffer = np.zeros((0, 1), dtype=np.float32)
+        last_audio_time = time.monotonic()
+
         while self.is_listening:
             if getattr(self, "_settings_applying", False):
-                time.sleep(0.05)
+                time.sleep(0.03)
                 continue
+
+            # Drain queue quickly
+            got_any = False
             while not audio_queue.empty():
-                temp_buffer = np.concatenate((temp_buffer, audio_queue.get()))
+                blk = audio_queue.get()
+                got_any = True
+                # Add to commit accumulator (keep original 2D)
+                self._commit_chunks.append(blk)
+                self._commit_total_samples += len(blk)
 
-            if len(temp_buffer) >= SAMPLERATE * 1:
-                preview_text = transcribe_buffer(temp_buffer[-SAMPLERATE:])
-                if preview_text and _preview_is_banned(preview_text):
-                    preview_text = ""
-                if preview_text:
-                    preview_text = strip_trailing_dot(preview_text)
-                    now = time.monotonic()
-                    self._last_preview_text = preview_text
-                    self._last_preview_ts = now
-                    self.root.after(0, lambda t=preview_text: self.preview_label.config(text="Preview: " + t))
+                # Add to tail as 1D (mono)
+                mono = blk[:, 0] if getattr(blk, "ndim", 0) > 1 else blk
+                mono = np.asarray(mono, dtype=np.float32, order="C")
+                self._push_tail(mono)
 
-            silence_tail = temp_buffer[-int(0.6 * SAMPLERATE):]
-            timeout = len(temp_buffer) >= SAMPLERATE * BLOCK_DURATION
+            if got_any:
+                last_audio_time = time.monotonic()
 
-            if (silence_tail.shape[0] >= int(0.5 * SAMPLERATE) and is_silence(silence_tail)) or timeout:
-                full_text = transcribe_buffer_commit(temp_buffer)
+            # Preview gating: only if enough tail and time since last preview
+            now = time.monotonic()
+            tail_needed = int(_preview_tail_sec() * SAMPLERATE * 0.6)  # need at least ~60% of window
+            if self._tail_total_samples >= tail_needed and (now - self._last_preview_decode_ts) >= PREVIEW_MIN_INTERVAL_SEC:
+                tail = self._concat_tail()
+                # quick silence gate
+                if not is_silence(tail, threshold_db=-48.0):
+                    preview_text = transcribe_buffer(tail)
+                    if preview_text and _preview_is_banned(preview_text):
+                        preview_text = ""
+                    if preview_text:
+                        preview_text = strip_trailing_dot(preview_text)
+                        if preview_text != self._last_preview_text:
+                            self._last_preview_text = preview_text
+                            self._last_preview_ts = now
+                            self.root.after(0, lambda t=preview_text: self.preview_label.config(text="Preview: " + t))
+                self._last_preview_decode_ts = now
+
+            # Commit conditions
+            timeout = self._commit_total_samples >= int(BLOCK_DURATION * SAMPLERATE)
+
+            # Tail silence?
+            tail = self._concat_tail() if self._tail_total_samples > 0 else None
+            tail_is_silence = bool(tail is not None and tail.shape[0] >= int(0.5 * SAMPLERATE) and is_silence(tail))
+
+            # Safety net: stop after 60s of inactivity
+            if (time.monotonic() - last_audio_time) > 60.0:
+                self.root.after(0, lambda: self.preview_label.config(text="Preview: (auto-stopped after inactivity)"))
+                self.stop_listening()
+                return
+
+            if tail_is_silence or timeout:
+                # Concatenate commit window only now
+                if not self._commit_chunks:
+                    # nothing to commit; just clear tail
+                    self._tail_chunks.clear()
+                    self._tail_total_samples = 0
+                    time.sleep(0.03)
+                    continue
+
+                buf = np.concatenate(self._commit_chunks, axis=0)
+                full_text = transcribe_buffer_commit(buf)
                 full_text = strip_trailing_dot(full_text)
 
                 if not full_text:
+                    # fallback to tail-only decode if recent preview was good
                     recent_preview = (time.monotonic() - getattr(self, "_last_preview_ts", 0.0)) < 3.0
                     if recent_preview and getattr(self, "_last_preview_text", ""):
                         try:
-                            tail = temp_buffer[-int(1.5 * SAMPLERATE):]
                             alt = transcribe_buffer(tail)
                             alt = strip_trailing_dot(alt)
                             if alt and not looks_like_outro(alt):
@@ -1826,39 +1921,102 @@ class SpeechSheetApp:
                         except Exception:
                             pass
 
-                try:
-                    if full_text and looks_like_outro(full_text):
-                        full_text = ""
-                except NameError:
-                    pass
-
-                if full_text:
+                if full_text and not looks_like_outro(full_text):
                     self.root.after(0, self.add_text_to_cell, full_text)
-                    self.root.after(0, lambda t=full_text: self.preview_label.config(text="Preview: " + t))
+                    # update preview label only if changed
+                    if full_text != self._last_preview_text:
+                        self._last_preview_text = full_text
+                        self._last_preview_ts = time.monotonic()
+                        self.root.after(0, lambda t=full_text: self.preview_label.config(text="Preview: " + t))
 
+                # schedule preview clear
                 try:
                     if getattr(self, "_preview_clear_after", None):
                         self.root.after_cancel(self._preview_clear_after)
                 except Exception:
                     pass
-
                 def _clear_preview():
-                    try:
-                        self.preview_label.config(text="Preview:")
-                    except Exception:
-                        pass
-                    finally:
-                        self._preview_clear_after = None
-
+                    try: self.preview_label.config(text="Preview:")
+                    except Exception: pass
+                    finally: setattr(self, "_preview_clear_after", None)
                 self._preview_clear_after = self.root.after(PREVIEW_CLEAR_DELAY_MS, _clear_preview)
 
-                temp_buffer = np.zeros((0, 1), dtype=np.float32)
+                # reset commit + tail efficiently
+                self._commit_chunks.clear()
+                self._commit_total_samples = 0
+                self._tail_chunks.clear()
+                self._tail_total_samples = 0
 
-            time.sleep(0.1)
+            time.sleep(0.02)  # tight loop for low latency, still cooperative
 
-    # ----------------------------
-    # EXPORT / SAVE / LOAD
-    # ----------------------------
+    def reset_audio_state(self):
+        global audio_queue
+        try:
+            while not audio_queue.empty():
+                audio_queue.get_nowait()
+        except Exception:
+            pass
+        self.buffer = np.zeros((0,1), dtype=np.float32)
+        self._tail_chunks.clear()
+        self._tail_total_samples = 0
+        self._commit_chunks.clear()
+        self._commit_total_samples = 0
+        try:
+            self.preview_label.config(text="Preview:")
+        except Exception:
+            pass
+
+    # Silence-guard timer (ensure we keep counting even if not listening)
+    def _start_silence_guard(self):
+        def tick():
+            if self.is_listening:
+                now = time.monotonic()
+                started = getattr(self, "_listening_started_ts", now)
+                if (now - started) >= SILENCE_GUARD_GRACE_SEC and (now - LAST_ACTIVITY_TS) > 60.0:
+                    self.stop_listening()
+                    self._flash_preview_note("⏸ Авто-стоп: нет входа 60с")
+            self._silence_guard_job = self.root.after(1000, tick)
+        self._silence_guard_job = self.root.after(1000, tick)
+
+    # Console detach (Windows)
+    def _detach_console_if_any(self):
+        if sys.platform.startswith("win"):
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                if kernel32.GetConsoleWindow():
+                    kernel32.FreeConsole()
+            except Exception:
+                pass
+
+    # Styling
+    def _style_action_buttons(self):
+        START_BG  = "#2e7d32"
+        START_BG_H= "#2b7030"
+        STOP_BG   = "#c62828"
+        STOP_BG_H = "#b12525"
+        TXT_LIGHT = "#ffffff"
+        def apply(btn, *, bg, bg_h, fg, disabled: bool):
+            if disabled:
+                btn.configure(
+                    bg="#3a4352", fg="#9aa5b1",
+                    activebackground="#3a4352", activeforeground="#9aa5b1"
+                )
+            else:
+                btn.configure(
+                    bg=bg, fg=fg,
+                    activebackground=bg_h, activeforeground=fg,
+                    highlightthickness=1
+                )
+        try:
+            apply(self.start_btn, bg=START_BG, bg_h=START_BG_H, fg=TXT_LIGHT,
+                  disabled=(str(self.start_btn.cget("state")) == "disabled"))
+            apply(self.stop_btn,  bg=STOP_BG,  bg_h=STOP_BG_H,  fg=TXT_LIGHT,
+                  disabled=(str(self.stop_btn.cget("state")) == "disabled"))
+        except Exception:
+            pass
+
+    # Export / save / load
     def export_data(self):
         data = self.sheet.get_sheet_data()
         df = pd.DataFrame(data, columns=self.headers)
@@ -1868,12 +2026,10 @@ class SpeechSheetApp:
         )
         if not file_path:
             return
-
         if file_path.endswith(".csv"):
             df.to_csv(file_path, index=False, encoding="utf-8-sig")
             messagebox.showinfo("Exported", f"Data exported to:\n{file_path}")
             return
-
         try:
             df.to_excel(file_path, index=False)
             messagebox.showinfo("Exported", f"Data exported to:\n{file_path}")
@@ -1883,7 +2039,7 @@ class SpeechSheetApp:
                 df.to_csv(alt_csv, index=False, encoding="utf-8-sig")
                 messagebox.showwarning(
                     "Exported as CSV",
-                    f"Excel export requires 'openpyxl' or 'xlsxwriter' which is not bundled.\n"
+                    f"Excel export requires 'openpyxl' or 'xlsxwriter' which may not be bundled.\n"
                     f"Saved CSV instead:\n{alt_csv}\n\nDetails: {e}"
                 )
             except Exception as e2:
@@ -1902,12 +2058,8 @@ class SpeechSheetApp:
                 df.columns = self.headers
             self.sheet.set_sheet_data(df.values.tolist())
         else:
-            for _ in range(20):
-                self.add_row()
+            self.add_rows(20)
 
-    # ----------------------------
-    # COLUMN WIDTHS
-    # ----------------------------
     def save_column_widths(self):
         self._persist_column_widths_to_settings()
 
@@ -1920,19 +2072,14 @@ class SpeechSheetApp:
         except Exception as e:
             print("load_column_widths error (read):", e)
             return
-
         widths = settings.get("column_widths")
         if widths is None:
             return
-
         try:
             self.apply_column_widths(widths)
         except Exception as e:
             print("load_column_widths error (apply):", e)
 
-    # ----------------------------
-    # CLOSE
-    # ----------------------------
     def on_close(self):
         try:
             self.is_listening = False
@@ -1943,7 +2090,10 @@ class SpeechSheetApp:
                     self._preview_clear_after = None
             except Exception:
                 pass
-
+            if self._silence_guard_job:
+                try: self.root.after_cancel(self._silence_guard_job)
+                except Exception: pass
+                self._silence_guard_job = None
             self.save_data()
             self.save_column_widths()
         finally:
@@ -1953,14 +2103,30 @@ class SpeechSheetApp:
                 pass
             self.root.destroy()
 
-# ----------------------------
-# Glossary Editor (unchanged, minus cosmetic tweaks)
-# ----------------------------
+    # Loading overlay
+    def _show_loading(self, text: str = "Loading…"):
+        self._loading = tk.Toplevel(self.root)
+        self._loading.title("Please wait")
+        self._loading.geometry("320x120")
+        self._loading.transient(self.root)
+        self._loading.grab_set()
+        lbl = tk.Label(self._loading, text=text)
+        lbl.pack(expand=True, fill="both", padx=20, pady=20)
+        try: enable_crisp_dark_mode(self._loading, dark=True, delay_ms=0)
+        except Exception: pass
+        self._loading.update()
+
+    def _hide_loading(self):
+        try:
+            if hasattr(self, "_loading") and self._loading.winfo_exists():
+                self._loading.destroy()
+        except Exception:
+            pass
+
+# ===========================
+# Glossary Editor (unchanged features)
+# ===========================
 class GlossaryEditor(tk.Toplevel):
-    """
-    Simple editor for glossary.json:
-    { "Имя": ["Иван","Мария"], "Фамилия": ["Иванов","Петров"], ... }
-    """
     def __init__(self, master, path: str, on_saved=None):
         super().__init__(master)
         self.title("Glossary Editor")
@@ -2167,7 +2333,6 @@ class GlossaryEditor(tk.Toplevel):
             f = _tkfont.nametofont("TkTextFont")
         except Exception:
             f = None
-
         def fit(lb: tk.Listbox):
             items = lb.get(0, "end")
             if not items:
@@ -2180,7 +2345,6 @@ class GlossaryEditor(tk.Toplevel):
             else:
                 ch = max(24, max(len(str(s)) for s in items))
                 lb.configure(width=ch)
-
         fit(self.headers_lb)
         fit(self.terms_lb)
 
@@ -2224,7 +2388,6 @@ class GlossaryEditor(tk.Toplevel):
         if name in self.data:
             messagebox.showinfo("Info", "This column already exists.")
             return
-
         self.data[name] = []
         self._refresh_headers()
         headers_sorted = sorted(self.data.keys(), key=str.lower)
@@ -2275,7 +2438,7 @@ class GlossaryEditor(tk.Toplevel):
             messagebox.showinfo("Info", "This term already exists in the column.")
             return
         arr.append(term)
-        self.term_entry.delete(0, "end")
+        self.term_entry.delete("end", "end")
         self._refresh_terms()
 
     def _remove_term(self):
@@ -2291,8 +2454,10 @@ class GlossaryEditor(tk.Toplevel):
     def _save(self):
         try:
             self._write_to_file()
-            try: self.on_saved()
-            except Exception: pass
+            try:
+                self.on_saved()
+            except Exception:
+                pass
             messagebox.showinfo("Saved", f"Glossary saved to:\n{self.path}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save glossary:\n{e}")
@@ -2317,38 +2482,35 @@ class GlossaryEditor(tk.Toplevel):
         finally:
             self.destroy()
 
-# ----------------------------
-# Settings (cleaned: no VAD sliders)
-# ----------------------------
+# ===========================
+# Settings dialog (adds model picker + speed mode)
+# ===========================
 class SettingsDialog(tk.Toplevel):
     def __init__(self, master, initial: dict, on_apply: Callable[[dict], None], on_reset_widths: Optional[Callable[[], None]] = None):
         super().__init__(master)
         self.title("Settings")
-        self.geometry("560x340")
-        self.minsize(380, 240)
+        self.geometry("560x460")
+        self.minsize(380, 300)
         self.transient(master)
         self.on_apply = on_apply
         self.on_reset_widths = on_reset_widths
 
         c = _gfm_palette(True)
         self.configure(bg=c["bg"])
-
         frm = tk.Frame(self, bg=c["bg"])
         frm.pack(fill="both", expand=True, padx=14, pady=12)
 
         def lab(parent, txt):
             return tk.Label(parent, text=txt, bg=c["bg"], fg=c["text"])
 
+        # Language
         lab(frm, "Recognition language").grid(row=0, column=0, sticky="w", pady=(0,4))
         cur_code = str(initial.get("language", "auto")).lower() if initial.get("language", None) is not None else "auto"
         cur_label = _CODE_TO_LABEL.get(cur_code, _CODE_TO_LABEL["auto"])
-
         self.var_lang_label = tk.StringVar(value=cur_label)
         if ttk:
-            self.cmb_lang = ttk.Combobox(
-                frm, state="readonly", values=_LANG_LABELS,
-                textvariable=self.var_lang_label, style="Settings.TCombobox",
-            )
+            self.cmb_lang = ttk.Combobox(frm, state="readonly", values=_LANG_LABELS,
+                                         textvariable=self.var_lang_label, style="Settings.TCombobox")
             self.cmb_lang.grid(row=1, column=0, sticky="ew", padx=(0,6), pady=(0,10))
         else:
             self.cmb_lang = tk.OptionMenu(frm, self.var_lang_label, *_LANG_LABELS)
@@ -2356,17 +2518,42 @@ class SettingsDialog(tk.Toplevel):
                                     highlightbackground=c["border"], relief="flat")
             self.cmb_lang.grid(row=1, column=0, sticky="ew", padx=(0,6), pady=(0,10))
 
-        lab(frm, "Autosave period (minutes)").grid(row=2, column=0, sticky="w", pady=(0,4))
+        # Model
+        lab(frm, "Model").grid(row=2, column=0, sticky="w", pady=(0,4))
+        cur_model_key = initial.get("model_key", _pick_default_model_key())
+        cur_model_label = _MODELKEY_TO_LABEL.get(cur_model_key, "Small")
+        self.var_model_label = tk.StringVar(value=cur_model_label)
+        if ttk:
+            self.cmb_model = ttk.Combobox(frm, state="readonly", values=_MODEL_LABELS,
+                                          textvariable=self.var_model_label, style="Settings.TCombobox")
+            self.cmb_model.grid(row=3, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+        else:
+            self.cmb_model = tk.OptionMenu(frm, self.var_model_label, *_MODEL_LABELS)
+            self.cmb_model.configure(bg=c["surface"], fg=c["entry_fg"], highlightthickness=1,
+                                     highlightbackground=c["border"], relief="flat")
+            self.cmb_model.grid(row=3, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+
+        # Autosave
+        lab(frm, "Autosave period (minutes)").grid(row=4, column=0, sticky="w", pady=(0,4))
         self.var_auto = tk.StringVar(value=str(initial.get("autosave_minutes", 5)))
         e_auto = tk.Entry(frm, textvariable=self.var_auto, relief="flat",
                           bg=c["surface"], fg=c["entry_fg"], insertbackground=c["entry_fg"])
-        e_auto.grid(row=3, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+        e_auto.grid(row=5, column=0, sticky="ew", padx=(0,6), pady=(0,10))
 
-        lab(frm, "UI Scale (e.g., 1.00, 1.25)").grid(row=4, column=0, sticky="w", pady=(0,4))
+        # UI scale
+        lab(frm, "UI Scale (e.g., 1.00, 1.25)").grid(row=6, column=0, sticky="w", pady=(0,4))
         self.var_scale = tk.StringVar(value=str(initial.get("ui_scale", 1.0)))
         e_scale = tk.Entry(frm, textvariable=self.var_scale, relief="flat",
                            bg=c["surface"], fg=c["entry_fg"], insertbackground=c["entry_fg"])
-        e_scale.grid(row=5, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+        e_scale.grid(row=7, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+
+        # Speed mode
+        self.var_speed = tk.BooleanVar(value=bool(initial.get("speed_mode", False)))
+        speed_box = tk.Checkbutton(frm, text="Speed mode (lower latency, may reduce accuracy)",
+                                   variable=self.var_speed, bg=c["bg"], fg=c["text"],
+                                   activebackground=c["bg"], activeforeground=c["text"],
+                                   selectcolor=c.get("surface", "#151a21"))
+        speed_box.grid(row=8, column=0, sticky="w", pady=(4,10))
 
         frm.grid_columnconfigure(0, weight=1)
 
@@ -2391,6 +2578,7 @@ class SettingsDialog(tk.Toplevel):
             except Exception:
                 messagebox.showerror("Invalid value", "Autosave must be an integer ≥ 1.")
                 return
+
             try:
                 scale = float(self.var_scale.get())
                 if scale < 0.75 or scale > 2.5:
@@ -2399,10 +2587,15 @@ class SettingsDialog(tk.Toplevel):
                 messagebox.showerror("Invalid value", "UI Scale must be between 0.75 and 2.5.")
                 return
 
+            model_label = self.var_model_label.get()
+            model_key = _LABEL_TO_MODELKEY.get(model_label, _pick_default_model_key())
+
             s = {
                 "language": lang_code,
                 "autosave_minutes": auto_m,
                 "ui_scale": scale,
+                "model_key": model_key,
+                "speed_mode": bool(self.var_speed.get()),
             }
             try:
                 self.on_apply(s)
@@ -2431,15 +2624,44 @@ class SettingsDialog(tk.Toplevel):
         except Exception:
             pass
 
-# ----------------------------
-# MAIN
-# ----------------------------
-if __name__ == "__main__":
-    _apply_settings_to_globals(_read_settings_from_file())
+# ===========================
+# App entry
+# ===========================
+LAST_ACTIVITY_TS = time.monotonic()
+SILENCE_GUARD_GRACE_SEC = 5.0  # don't auto-stop within first 5s after starting
 
-    # Log chosen devices (model is not created yet; this is just info)
+def _boost_process_priority_windows():
+    if not sys.platform.startswith("win"):
+        return
     try:
-        print(f"[Devices] Torch CUDA available={torch.cuda.is_available()} | planned Whisper device={'cuda' if torch.cuda.is_available() else 'cpu'} | compute_type={COMPUTE_TYPE}")
+        import ctypes
+        # https://learn.microsoft.com/en-us/windows/win32/procthread/scheduling-priorities
+        HIGH_PRIORITY_CLASS = 0x00000080
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), HIGH_PRIORITY_CLASS)
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    # Load saved settings and decide defaults
+    s = _read_settings_from_file()
+    _apply_settings_to_globals(s)
+    if not MODEL_KEY:
+        MODEL_KEY = _pick_default_model_key()
+
+    # Preload Silero + Whisper + warmup BEFORE UI shows
+    _load_silero_vad()
+    _load_whisper_model(MODEL_KEY)
+    _warmup_model()
+
+    # Optional: boost process priority on Windows (safe level)
+    _boost_process_priority_windows()
+
+    # Log devices
+    try:
+        print(f"[Devices] Whisper device={device}; compute_type={COMPUTE_TYPE}; "
+              f"Silero device={_silero_device}; torch.cuda={torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print("[CUDA] device name:", torch.cuda.get_device_name(0))
     except Exception as _e:
         print("Device log error:", _e)
 
