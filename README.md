@@ -35,6 +35,10 @@ Deactivate virtual environment:
 deactivate
 ```
 
+Build
+pyinstaller --clean --noconfirm --distpath ..\..\dist --workpath ..\..\build .\geneograph_voix.spec
+
+
 ### macOS
 
 Configure virtual environment:

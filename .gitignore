@@ -15,3 +15,11 @@ dist/
 # Visual Studio files
 .vs/
 *.user
+
+# Assets
+assets/
+src/geneograph_voix/runtime_cache/
+
+# Settings & Records
+*.json
+*.csv

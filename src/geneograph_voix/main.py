@@ -57,8 +57,7 @@ from faster_whisper import WhisperModel
 # ----------------------------
 # SETTINGS (cleaned; no WebRTC VAD)
 # ----------------------------
-MODEL_SIZE = "large-v3"
-LANGUAGE = "ru"
+MODEL_SIZE = "small"
 SAMPLERATE = 16000
 BLOCK_DURATION = 7               # seconds to force a commit if user speaks continuously
 COMPUTE_TYPE = "auto"            # "auto" for best effort (we resolve on first init)
