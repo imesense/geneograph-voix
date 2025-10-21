@@ -105,8 +105,8 @@ PREVIEW_MIN_INTERVAL_SEC = 0.35
 PREVIEW_TAIL_SEC_DEFAULT = 0.60
 PREVIEW_TAIL_SEC_SPEED   = 0.50
 
-COMMIT_TAIL_SILENCE_SEC = 2.00   # was ~0.60s inline; now 1.00s tail to deem “quiet enough” for commit
-COMMIT_MIN_SILENCE_SEC  = 1.90   # require at least 0.90s of tail available for the silence test
+COMMIT_TAIL_SILENCE_SEC = 0.60   # tail to deem “quiet enough” for commit
+COMMIT_MIN_SILENCE_SEC  = 0.50   # require at least 0.90s of tail available for the silence test
 
 def _preview_tail_sec() -> float:
     return PREVIEW_TAIL_SEC_SPEED if SPEED_MODE else PREVIEW_TAIL_SEC_DEFAULT
@@ -299,7 +299,7 @@ def _read_settings_from_file() -> dict:
     return {}
 
 def _apply_settings_to_globals(s: dict):
-    global LANGUAGE, AUTOSAVE_EVERY_MS, UI_SCALE, MODEL_KEY, SPEED_MODE
+    global LANGUAGE, AUTOSAVE_EVERY_MS, UI_SCALE, MODEL_KEY, SPEED_MODE, VAD_STRICTNESS, GLOSSARY_STRICTNESS, APPEND_MODE
     try:
         if "language" in s and isinstance(s["language"], str):
             LANGUAGE = s["language"].strip() or "auto"
