@@ -99,20 +99,19 @@ SAMPLERATE = 16000
 AUDIO_BLOCK_SEC = 0.10   # capture block size for low latency
 BLOCK_DURATION = 5       # seconds to force a commit if user speaks continuously
 
-# Silero VAD (only)
-SILERO_THRESHOLD = 0.40
-SILERO_MIN_SPEECH_MS = 120
-SILERO_MIN_SILENCE_MS = 250
-SILERO_PAD_MS = 250
-
 # Preview + speed knobs
 SPEED_MODE = False         # exposed in Settings
 PREVIEW_MIN_INTERVAL_SEC = 0.35
 PREVIEW_TAIL_SEC_DEFAULT = 0.60
 PREVIEW_TAIL_SEC_SPEED   = 0.50
 
+COMMIT_TAIL_SILENCE_SEC = 2.00   # was ~0.60s inline; now 1.00s tail to deem “quiet enough” for commit
+COMMIT_MIN_SILENCE_SEC  = 1.90   # require at least 0.90s of tail available for the silence test
+
 def _preview_tail_sec() -> float:
     return PREVIEW_TAIL_SEC_SPEED if SPEED_MODE else PREVIEW_TAIL_SEC_DEFAULT
+
+APPEND_MODE = False # Append mode (when True, append instead of replace on commit)
 
 # Autosave
 AUTOSAVE_EVERY_MS = 5 * 60 * 1000   # 5 minutes
@@ -130,7 +129,7 @@ BAN_PHRASES = tuple(s.lower() for s in (
     "Dima Torzhok", "DimaTorzok", "DimaTorzhok",
     "Продолжение следует", "Субтитры",
     "Редактор субтитров А.Семкин Корректор А.Егорова",
-    "Редактор субтитров","Редактор", "Спасибо", "Thank you", "Смотрите На Видео", "Увидимся"
+    "Редактор субтитров","Редактор", "Спасибо", "Thank you", "Смотрите На Видео", "Увидимся", "Стук в дверь", "Динамичная музыка"
 ))
 MALE_EXCEPTIONS = {
     "акила","арефа","вавила","варнава","иеремия","иона","исая","иуда",
@@ -174,6 +173,32 @@ def _no_speech_thresholds():
     cr_preview  = {1:2.40, 2:2.30, 3:2.20, 4:2.10, 5:2.05}[l]
     cr_commit   = {1:2.20, 2:2.10, 3:2.00, 4:1.95, 5:1.90}[l]
     return preview_nst, commit1_nst, commit2_nst, cr_preview, cr_commit
+
+# ---------------------------
+# Glossary correction strictness (1..5)
+# ---------------------------
+GLOSSARY_STRICTNESS = 3  # 1 = loose (more willing to auto-correct), 5 = strict (very conservative)
+
+def _glossary_thresholds(L: int, level: int | None = None):
+    """
+    Dynamic thresholds for glossary correction.
+    Higher level => more aggressive corrections (useful for tiny/base models).
+    Returns: (max_edits, min_dice, req_anchor, score_gap)
+    """
+    level = int(max(1, min(5, level if level is not None else GLOSSARY_STRICTNESS)))
+    base_ed  = _len_aware_max_edits(L)          # length-aware rough edits allowance
+    base_d   = _min_dice_for_len(L)             # length-aware minimum Dice similarity
+    # Aggressiveness maps
+    ed_bonus = {1:0.3, 2:0.5, 3:0.7, 4:1.0, 5:1.4}[level]   # allow more edits as level grows
+    dice_adj = {1:+0.06, 2:+0.03, 3:0.00, 4:-0.05, 5:-0.10}[level]  # relax min dice at higher levels
+    anchor_base = 2 if L <= 5 else 3
+    anchor_adj  = {1:0, 2:0, 3:0, 4:-1, 5:-1}[level]        # require slightly less anchoring at high levels
+    score_gap   = {1:0.40, 2:0.38, 3:0.35, 4:0.22, 5:0.15}[level]   # how much better the winner must be
+
+    max_ed   = base_ed + ed_bonus
+    min_d    = max(0.0, min(0.95, base_d + dice_adj))
+    req_anchor = max(1, anchor_base + anchor_adj)
+    return max_ed, min_d, req_anchor, score_gap
 
 # =========================================
 # Devices, threading, compute types
@@ -293,6 +318,14 @@ def _apply_settings_to_globals(s: dict):
                 globals()["VAD_STRICTNESS"] = max(1, min(5, lvl))
             except Exception:
                 pass
+        if "glossary_strictness" in s:
+            try:
+                lvl = int(s["glossary_strictness"])
+                globals()["GLOSSARY_STRICTNESS"] = max(1, min(5, lvl))
+            except Exception:
+                pass
+        if "append_mode" in s:
+            APPEND_MODE = bool(s["append_mode"])
     except Exception as e:
         print("settings apply error:", e)
 
@@ -416,7 +449,7 @@ COMPUTE_TYPE = None
 
 def _pick_default_model_key() -> str:
     # CPU → small ; CUDA → turbo (large-v3-turbo)
-    return "turbo" if device == "cuda" else "small"
+    return "large-v3-turbo" if device == "cuda" else "small"
 
 def _load_whisper_model(model_key: str):
     global model, COMPUTE_TYPE
@@ -678,6 +711,13 @@ def _ru_norm_merge(s: str) -> str:
     t = _ru_norm(s)
     return t.replace("тс", "ц")
 
+def _trim_soft(s: str) -> str:
+    return re.sub(r"[ьъ]+$", "", s or "")
+
+def _cons_skeleton(s: str) -> str:
+    t = _trim_soft(s.lower().replace("ё", "е"))
+    return "".join(ch for ch in t if ch.isalpha() and not _is_vowel_ru(ch) and ch not in "й")
+
 CONFUSION_CLASSES = [
     set("бп"), set("вф"), set("гкх"), set("дт"), set("зсц"),
     set("жшщч"),
@@ -863,14 +903,26 @@ def _best_two_candidates(a_norm: str, g_norm: list[tuple[str, str]]) -> tuple[Op
     last  = a_norm[-1] if a_norm else ""
     use_coarse = len(a_norm) >= 5
 
-    def _edge_ok(a_ch: str, b_ch: str) -> bool:
-        if not a_ch or not b_ch: return False
-        return a_ch == b_ch or _same_confusion_class(a_ch, b_ch)
+    def _edge_ok(a_ch: str, b_ch: str, *, is_last: bool = False) -> bool:
+        if not a_ch or not b_ch:
+            return False
+        if a_ch == b_ch:
+            return True
+        # Soft/hard sign at the end: don't block
+        if is_last and (a_ch in "ьъ" or b_ch in "ьъ"):
+            return True
+        # Consonant confusion classes (б/п, д/т, ж/ш/щ/ч, ...)
+        if _same_confusion_class(a_ch, b_ch):
+            return True
+        # Vowels frequently wobble in speech (о/у/а/э/и/ы/я/ю/е/ё/і/ї/є)
+        if _is_vowel_ru(a_ch) and _is_vowel_ru(b_ch):
+            return True
+        return False
 
     for orig, b in g_norm:
         if not b:
             continue
-        if use_coarse and not (_edge_ok(first, b[0]) or _edge_ok(last, b[-1])):
+        if use_coarse and not (_edge_ok(first, b[0]) or _edge_ok(last, b[-1], is_last=True)):
             continue
         d_lev = _lev(a_norm, b)
         L = max(len(a_norm), len(b))
@@ -908,28 +960,59 @@ def _best_two_cached(header: str, a_norm: str, g_norm: list[tuple[str, str]], *,
 def _should_correct_from_norm(a_norm: str, best: Optional[_Best], runner_up: Optional[_Best]) -> bool:
     if not best or not a_norm:
         return False
+
     L = max(len(a_norm), len(best.norm))
     wdl  = best.wdl
     dice = best.dice
     anchor = max(best.lcp, best.lcs)
     phon = best.phon
 
-    max_ed = _len_aware_max_edits(L) + 0.5
-    min_d  = _min_dice_for_len(L) - 0.03
-    req_anchor = 2 if L <= 5 else 3
+    max_ed, min_d, req_anchor, score_gap = _glossary_thresholds(L, GLOSSARY_STRICTNESS)
 
+    # Consonant-skeleton rescue for voice: high when (рс л) matches even if vowels/ь differ
+    sk_a = _cons_skeleton(a_norm)
+    sk_b = _cons_skeleton(best.norm)
+    sk_dice = _dice_sim(sk_a, sk_b) if sk_a and sk_b else 0.0
+    sk_len  = max(len(sk_a), len(sk_b))
+
+    # If phonetics are very close, slightly relax Dice
     if dice < min_d and phon <= 1.0:
-        min_d -= 0.07
-    if wdl > max_ed: return False
-    if dice < min_d: return False
-    if anchor < req_anchor: return False
+        min_d -= 0.05
 
+    # If skeleton is strong, relax Dice at higher levels
+    if GLOSSARY_STRICTNESS >= 4 and sk_len >= 3 and sk_dice >= 0.80:
+        min_d = min(min_d, 0.50)
+
+    # Basic gates
+    if wdl > max_ed:        return False
+    if dice < min_d:        # might still pass under aggressive rules below
+        pass
+    else:
+        if anchor >= req_anchor:
+            return True
+
+    # No runner-up? accept if other signals are strong
     if runner_up is None:
+        return (anchor >= req_anchor) or (GLOSSARY_STRICTNESS >= 4 and sk_len >= 3 and sk_dice >= 0.80 and wdl <= (max_ed + 0.2))
+
+    # Compare combined scores (lower is better)
+    score_best, _, _, _ = _combined_score(a_norm, best.norm)
+    score_run , _, _, _ = _combined_score(a_norm, runner_up.norm)
+    if (score_run - score_best) >= score_gap and anchor >= max(1, req_anchor - 1):
         return True
 
-    score_best, _, _, _   = _combined_score(a_norm, best.norm)
-    score_run , _, _, _   = _combined_score(a_norm, runner_up.norm)
-    return (score_run - score_best) >= 0.35
+    # Aggressive voice-specific acceptance at high levels
+    if GLOSSARY_STRICTNESS >= 4:
+        # Small edit distance + strong anchoring OR strong skeleton
+        if (_lev(a_norm, best.norm) <= 2 and max(best.lcp, best.lcs) >= (L - 2)):
+            return True
+        if sk_len >= 3 and sk_dice >= 0.85 and _lev(sk_a, sk_b) <= 1:
+            return True
+        # Terminal soft sign noise
+        if _trim_soft(a_norm) == _trim_soft(best.norm) and _lev(a_norm, best.norm) <= 2:
+            return True
+
+    return False
 
 def _should_correct(token: str, best: Optional[_Best], runner_up: Optional[_Best]) -> bool:
     a_norm = _ru_norm(token)
@@ -1588,22 +1671,49 @@ class SpeechSheetApp:
         row, col = list(selected)[0]
         header = self.headers[col]
 
-        raw = (text or "").strip()
+        incoming = (text or "").strip()
+        if not incoming:
+            return
+
+        # Compute processed value first (date normalization OR glossary/name cleaning)
+        processed = None
+
         if header == "Дата":
-            value = normalize_date(raw)
+            value = normalize_date(incoming)
             if value is None:
                 try: self.root.bell()
                 except Exception: pass
                 self.preview_label.config(text="🎤 Preview: (дата не распознана — повторите)")
                 return
-            self.sheet.set_cell_data(row, col, value)
+            processed = value
+        else:
+            value = correct_text_for_column(incoming, header)
+            if header in NAME_COLUMNS:
+                value = clean_person_field(value)
+            processed = value
+
+        # Safety
+        processed = (processed or "").strip()
+        if not processed:
             return
 
-        raw = correct_text_for_column(raw, header)
-        if header in NAME_COLUMNS:
-            raw = clean_person_field(raw)
+        # NEW — Append mode: append to existing cell instead of replacing (for all inputs)
+        if APPEND_MODE:
+            try:
+                existing = self.sheet.get_cell_data(row, col) or ""
+            except Exception:
+                existing = ""
+            existing = str(existing).strip()
+            if existing:
+                # simple spacing — could be enhanced to punctuation-aware merges
+                new_value = (existing + " " + processed).strip()
+            else:
+                new_value = processed
+            self.sheet.set_cell_data(row, col, new_value)
+        else:
+            # original replace behavior
+            self.sheet.set_cell_data(row, col, processed)
 
-        self.sheet.set_cell_data(row, col, raw)
 
     def open_glossary_editor(self):
         win = GlossaryEditor(self.root, GLOSSARY_FILE, on_saved=lambda: load_glossaries())
@@ -1753,7 +1863,10 @@ class SpeechSheetApp:
             "model_key": MODEL_KEY or _pick_default_model_key(),
             "speed_mode": SPEED_MODE,
             "vad_strictness": VAD_STRICTNESS,
+            "glossary_strictness": GLOSSARY_STRICTNESS,
+            "append_mode": APPEND_MODE, 
         }
+
 
     def _refresh_preview_font(self):
         try:
@@ -1943,14 +2056,15 @@ class SpeechSheetApp:
             # Commit conditions
             timeout = self._commit_total_samples >= int(BLOCK_DURATION * SAMPLERATE)
 
-            # Tail silence? (use the last ~0.6 s of the tail; fall back to whatever length we have)
+            # Tail silence? (use the last ~1.0 s of the tail; fall back to whatever length we have)
             if self._tail_total_samples > 0:
                 tail = self._concat_tail()
-                tail_len_samples = int(0.6 * SAMPLERATE)
+                # CHANGED — use the new knobs
+                tail_len_samples = int(COMMIT_TAIL_SILENCE_SEC * SAMPLERATE)  # NEW (was int(0.6 * SAMPLERATE))
                 tail_sil = tail[-tail_len_samples:] if tail.shape[0] >= tail_len_samples else tail
                 tail_is_silence = (
                     tail_sil is not None
-                    and tail_sil.shape[0] >= int(0.5 * SAMPLERATE)
+                    and tail_sil.shape[0] >= int(COMMIT_MIN_SILENCE_SEC * SAMPLERATE)  # NEW (was 0.5s)
                     and is_silence(tail_sil, threshold_db=_energy_gate_db())
                 )
             else:
@@ -2200,7 +2314,7 @@ class GlossaryEditor(tk.Toplevel):
         super().__init__(master)
         self.title("Glossary Editor")
         self.geometry("820x500")
-        self.minsize(700, 420)
+        self.minsize(820, 520)
         self.transient(master)
         self.path = path
         self.on_saved = on_saved or (lambda: None)
@@ -2558,8 +2672,8 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, master, initial: dict, on_apply: Callable[[dict], None], on_reset_widths: Optional[Callable[[], None]] = None):
         super().__init__(master)
         self.title("Settings")
-        self.geometry("560x460")
-        self.minsize(380, 300)
+        self.geometry("650x650")
+        self.minsize(650, 650)
         self.transient(master)
         self.on_apply = on_apply
         self.on_reset_widths = on_reset_widths
@@ -2617,9 +2731,8 @@ class SettingsDialog(tk.Toplevel):
         e_scale.grid(row=7, column=0, sticky="ew", padx=(0,6), pady=(0,10))
 
         # VAD strictness
-        lab(frm, "VAD Strictness (1=loose, 5=strict)").grid(row=8, column=0, sticky="w", pady=(0,4))
-        cur_vad = int(initial.get("vad_strictness", 3))
-        self.var_vad = tk.IntVar(value=cur_vad)
+        lab(frm, "VAD Strictness (1 = loose, 5 = strict)").grid(row=8, column=0, sticky="w", pady=(0,4))
+        self.var_vad = tk.IntVar(value=int(initial.get("vad_strictness", 3)))
         self.sld_vad = tk.Scale(
             frm, from_=1, to=5, orient="horizontal", variable=self.var_vad,
             bg=c["bg"], fg=c["text"], troughcolor=c["border"], highlightthickness=0, relief="flat",
@@ -2627,16 +2740,39 @@ class SettingsDialog(tk.Toplevel):
         )
         self.sld_vad.grid(row=9, column=0, sticky="w", padx=(0,6), pady=(0,10))
 
+        # Glossary strictness
+        lab(frm, "Glossary correction strictness (1 = cautious, 5 = aggressive)").grid(row=10, column=0, sticky="w", pady=(0,4))
+        self.var_gloss = tk.IntVar(value=int(initial.get("glossary_strictness", 3)))
+        self.sld_gloss = tk.Scale(
+            frm, from_=1, to=5, orient="horizontal", variable=self.var_gloss,
+            bg=c["bg"], fg=c["text"], troughcolor=c["border"], highlightthickness=0, relief="flat",
+            showvalue=True, length=240
+        )
+        self.sld_gloss.grid(row=11, column=0, sticky="w", padx=(0,6), pady=(0,10))
+
         # Speed mode
         self.var_speed = tk.BooleanVar(value=bool(initial.get("speed_mode", False)))
         speed_box = tk.Checkbutton(frm, text="Speed mode (lower latency, may reduce accuracy)",
                                    variable=self.var_speed, bg=c["bg"], fg=c["text"],
                                    activebackground=c["bg"], activeforeground=c["text"],
                                    selectcolor=c.get("surface", "#151a21"))
-        speed_box.grid(row=10, column=0, sticky="w", pady=(4,10))
+        speed_box.grid(row=12, column=0, sticky="w", pady=(4,10))
 
         frm.grid_columnconfigure(0, weight=1)
 
+        # NEW — Append mode
+        self.var_append = tk.BooleanVar(value=bool(initial.get("append_mode", False)))
+        append_box = tk.Checkbutton(
+            frm,
+            text="Append mode (append to cell instead of replacing)",
+            variable=self.var_append,
+            bg=c["bg"], fg=c["text"],
+            activebackground=c["bg"], activeforeground=c["text"],
+            selectcolor=c.get("surface", "#151a21")
+        )
+        append_box.grid(row=13, column=0, sticky="w", pady=(0,10))
+
+        # Buttons
         btns = tk.Frame(self, bg=c["bg"])
         btns.pack(fill="x", padx=14, pady=(0,12))
 
@@ -2676,21 +2812,14 @@ class SettingsDialog(tk.Toplevel):
                 "ui_scale": scale,
                 "model_key": model_key,
                 "speed_mode": bool(self.var_speed.get()),
+                "vad_strictness": max(1, min(5, int(self.var_vad.get()))),
+                "glossary_strictness": max(1, min(5, int(self.var_gloss.get()))),
+                "append_mode": bool(self.var_append.get()),
             }
             try:
                 self.on_apply(s)
             finally:
                 self.destroy()
-
-            vad_level = int(self.var_vad.get())
-            s = {
-                "language": lang_code,
-                "autosave_minutes": auto_m,
-                "ui_scale": scale,
-                "model_key": model_key,
-                "vad_strictness": max(1, min(5, vad_level)),
-            }
-
 
         def _reset_widths():
             if callable(self.on_reset_widths):
