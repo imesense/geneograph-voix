@@ -138,6 +138,43 @@ MALE_EXCEPTIONS = {
     "савва","илья","кузьма","мина","сила",
 }
 
+# ---------------------------
+# Dynamic VAD strictness (1..5)
+# ---------------------------
+VAD_STRICTNESS = 3  # default mid; 1=loose, 5=strict
+
+def _silero_params_for(level: int):
+    """
+    Map strictness -> Silero params (threshold, min_speech, min_silence, pad)
+    and energy gate (RMS dB floor). Higher = stricter.
+    """
+    level = int(max(1, min(5, level)))
+    table = {
+        1: dict(th=0.30, min_speech=80,  min_silence=150, pad=200, energy_db=-52.0),
+        2: dict(th=0.35, min_speech=100, min_silence=200, pad=220, energy_db=-48.0),
+        3: dict(th=0.40, min_speech=140, min_silence=260, pad=250, energy_db=-45.0),
+        4: dict(th=0.48, min_speech=200, min_silence=320, pad=260, energy_db=-42.0),
+        5: dict(th=0.56, min_speech=260, min_silence=380, pad=280, energy_db=-40.0),
+    }
+    return table[level]
+
+def _energy_gate_db() -> float:
+    return _silero_params_for(VAD_STRICTNESS)["energy_db"]
+
+def _no_speech_thresholds():
+    """
+    Preview/commit thresholds tuned by strictness.
+    Lower numbers = easier to discard silence (stricter).
+    Returns: (preview_nst, commit_pass1_nst, commit_pass2_nst, cr_preview, cr_commit)
+    """
+    l = int(max(1, min(5, VAD_STRICTNESS)))
+    preview_nst = {1:0.70, 2:0.65, 3:0.60, 4:0.58, 5:0.55}[l]
+    commit1_nst = {1:0.65, 2:0.62, 3:0.58, 4:0.56, 5:0.54}[l]
+    commit2_nst = {1:0.62, 2:0.60, 3:0.56, 4:0.54, 5:0.52}[l]
+    cr_preview  = {1:2.40, 2:2.30, 3:2.20, 4:2.10, 5:2.05}[l]
+    cr_commit   = {1:2.20, 2:2.10, 3:2.00, 4:1.95, 5:1.90}[l]
+    return preview_nst, commit1_nst, commit2_nst, cr_preview, cr_commit
+
 # =========================================
 # Devices, threading, compute types
 # =========================================
@@ -250,6 +287,12 @@ def _apply_settings_to_globals(s: dict):
             MODEL_KEY = s["model_key"]
         if "speed_mode" in s:
             SPEED_MODE = bool(s["speed_mode"])
+        if "vad_strictness" in s:
+            try:
+                lvl = int(s["vad_strictness"])
+                globals()["VAD_STRICTNESS"] = max(1, min(5, lvl))
+            except Exception:
+                pass
     except Exception as e:
         print("settings apply error:", e)
 
@@ -294,7 +337,7 @@ def audio_callback(indata, frames, time_info, status):
     try:
         x = np.asarray(indata, dtype=np.float32)
         if x.size > 0:
-            if rms_db(x.flatten()) > -55.0:
+            if rms_db(x.flatten()) > (_energy_gate_db() + 3.0):
                 LAST_ACTIVITY_TS = time.monotonic()
     except Exception:
         LAST_ACTIVITY_TS = time.monotonic()
@@ -307,8 +350,12 @@ def rms_db(x: np.ndarray) -> float:
     rms = np.sqrt(np.mean(x**2))
     return 20*np.log10(rms + 1e-12)
 
-def is_silence(buf: np.ndarray, threshold_db: float = -45.0) -> bool:
-    return rms_db(buf.flatten()) < threshold_db
+def is_silence(buf: np.ndarray, threshold_db: Optional[float] = None) -> bool:
+    if buf is None or getattr(buf, "size", 0) == 0:
+        return True
+    if threshold_db is None:
+        threshold_db = _energy_gate_db()
+    return rms_db(np.asarray(buf).flatten()) < float(threshold_db)
 
 # ===========================
 # Silero VAD only
@@ -343,26 +390,21 @@ def _load_silero_vad():
 def _silero_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> Optional[np.ndarray]:
     if not _has_silero or buf_f32 is None or getattr(buf_f32, "size", 0) == 0:
         return buf_f32
-    # quick RMS pre-gate: if too silent, skip VAD entirely
-    try:
-        if rms_db(buf_f32) < -50.0:
-            return None
-    except Exception:
-        pass
+    p = _silero_params_for(VAD_STRICTNESS)
     wav = torch.from_numpy(buf_f32).float()
     ts = _get_speech_ts(
         wav, _silero_model,
         sampling_rate=sr,
-        threshold=SILERO_THRESHOLD,
-        min_speech_duration_ms=SILERO_MIN_SPEECH_MS,
-        min_silence_duration_ms=SILERO_MIN_SILENCE_MS,
-        speech_pad_ms=SILERO_PAD_MS,
+        threshold=p["th"],
+        min_speech_duration_ms=p["min_speech"],
+        min_silence_duration_ms=p["min_silence"],
+        speech_pad_ms=p["pad"],
     )
     if not ts:
         return None
     start = ts[0]["start"]; end = ts[-1]["end"]
     trimmed = buf_f32[start:end]
-    if len(trimmed) < int(sr * 0.15):
+    if len(trimmed) < int(sr * 0.20):  # bump to 200 ms to be safer
         return None
     return trimmed
 
@@ -458,6 +500,10 @@ def strip_trailing_dot(text: str) -> str:
 def transcribe_buffer(buffer):
     if buffer.size == 0:
         return ""
+    # quick energy gate
+    if rms_db(buffer.flatten()) < (_energy_gate_db() + 2.0):
+        return ""
+    prev_nst, _, _, cr_prev, _ = _no_speech_thresholds()
     segments, _ = fw_transcribe(
         buffer,
         language=_effective_language(),
@@ -465,8 +511,8 @@ def transcribe_buffer(buffer):
         temperature=0.0,
         without_timestamps=True,
         condition_on_previous_text=False,
-        no_speech_threshold=0.75,
-        compression_ratio_threshold=2.3,
+        no_speech_threshold=prev_nst,
+        compression_ratio_threshold=cr_prev,
     )
     return " ".join((seg.text or "").strip() for seg in segments).strip()
 
@@ -477,7 +523,11 @@ def transcribe_buffer_commit(buffer):
     mono = buffer[:, 0] if getattr(buffer, "ndim", 0) > 1 else buffer
     mono = np.asarray(mono, dtype=np.float32, order="C")
 
-    # Trim with Silero if available (behind RMS pre-gate happens inside)
+    # Energy gate: don't even try if below floor
+    if rms_db(mono) < _energy_gate_db():
+        return ""
+
+    # Trim with Silero if available
     trimmed = mono
     try:
         if _has_silero:
@@ -485,22 +535,23 @@ def transcribe_buffer_commit(buffer):
             if t is not None:
                 trimmed = t
             else:
-                if not is_silence(mono, threshold_db=-50.0):
+                if not is_silence(mono):
                     trimmed = mono
                 else:
                     return ""
     except Exception:
         pass
 
-    # simple pre-emphasis for clarity
+    # pre-emphasis
     if trimmed.shape[0] > 1:
         x = trimmed.copy()
         x[1:] = x[1:] - 0.97 * x[:-1]
         trimmed = x
 
     samples = trimmed.flatten()
+    prev_nst, commit1_nst, commit2_nst, _, cr_commit = _no_speech_thresholds()
 
-    # First pass (fast & strict)
+    # First pass (stricter than before)
     segments, info = fw_transcribe(
         samples,
         language=_effective_language(),
@@ -508,19 +559,20 @@ def transcribe_buffer_commit(buffer):
         temperature=0.0,
         without_timestamps=True,
         condition_on_previous_text=False,
-        no_speech_threshold=0.85,
-        compression_ratio_threshold=2.1,
+        no_speech_threshold=commit1_nst,
+        compression_ratio_threshold=cr_commit,
     )
 
     segs = list(segments)
     full_text = " ".join((s.text or "").strip() for s in segs).strip()
 
+    # quick hallucination filters
     def _seg_suspicious(seg) -> bool:
         try:
             cr  = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
             lp  = float(getattr(seg, "avg_logprob", -10.0) or -10.0)
             nsp = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
-            return (cr > 2.2) or (lp < -0.5 and nsp > 0.5)
+            return (cr > 2.1) or (lp < -0.65 and nsp > 0.45)
         except Exception:
             return False
 
@@ -534,9 +586,8 @@ def transcribe_buffer_commit(buffer):
         if bad_flags and (sum(bad_flags) >= max(1, len(bad_flags)//2) or bad_flags[-1]):
             suspicious = True
 
-    # In SPEED_MODE, skip the retry pass entirely to save time
-    if suspicious and not SPEED_MODE:
-        # Retry with slightly relaxed thresholds
+    if suspicious:
+        # Retry with slightly different thresholds
         segments2, info2 = fw_transcribe(
             samples,
             language=_effective_language(),
@@ -544,8 +595,8 @@ def transcribe_buffer_commit(buffer):
             temperature=0.0,
             without_timestamps=True,
             condition_on_previous_text=False,
-            no_speech_threshold=0.90,
-            compression_ratio_threshold=2.0,
+            no_speech_threshold=commit2_nst,
+            compression_ratio_threshold=max(1.95, cr_commit - 0.05),
         )
         segs2 = list(segments2)
         alt = " ".join((s.text or "").strip() for s in segs2).strip()
@@ -555,7 +606,7 @@ def transcribe_buffer_commit(buffer):
                 cr  = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
                 lp  = float(getattr(seg, "avg_logprob", -10.0) or -10.0)
                 nsp = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
-                return (cr > 2.0) or (lp < -0.35 and nsp > 0.60)
+                return (cr > 2.0) or (lp < -0.55 and nsp > 0.50)
             except Exception:
                 return False
 
@@ -565,7 +616,10 @@ def transcribe_buffer_commit(buffer):
         if (not alt) or looks_outro or metrics_bad:
             return ""
         full_text = alt
-    elif suspicious and SPEED_MODE:
+
+    # “music” hallucination veto (short, low-info lines)
+    low = (full_text or "").lower()
+    if len(low) <= 24 and any(w in low for w in ("музык", "аплодисмент", "барабан", "спасибо")):
         return ""
 
     try:
@@ -573,6 +627,7 @@ def transcribe_buffer_commit(buffer):
     except Exception:
         pass
     return full_text
+
 
 # ===========================
 # Glossary correction (full logic retained)
@@ -1697,6 +1752,7 @@ class SpeechSheetApp:
             "ui_scale": UI_SCALE,
             "model_key": MODEL_KEY or _pick_default_model_key(),
             "speed_mode": SPEED_MODE,
+            "vad_strictness": VAD_STRICTNESS,
         }
 
     def _refresh_preview_font(self):
@@ -1870,7 +1926,9 @@ class SpeechSheetApp:
             if self._tail_total_samples >= tail_needed and (now - self._last_preview_decode_ts) >= PREVIEW_MIN_INTERVAL_SEC:
                 tail = self._concat_tail()
                 # quick silence gate
-                if not is_silence(tail, threshold_db=-48.0):
+                if rms_db(tail.flatten()) < (_energy_gate_db() + 2.0):
+                    preview_text = ""
+                else:
                     preview_text = transcribe_buffer(tail)
                     if preview_text and _preview_is_banned(preview_text):
                         preview_text = ""
@@ -1885,9 +1943,20 @@ class SpeechSheetApp:
             # Commit conditions
             timeout = self._commit_total_samples >= int(BLOCK_DURATION * SAMPLERATE)
 
-            # Tail silence?
-            tail = self._concat_tail() if self._tail_total_samples > 0 else None
-            tail_is_silence = bool(tail is not None and tail.shape[0] >= int(0.5 * SAMPLERATE) and is_silence(tail))
+            # Tail silence? (use the last ~0.6 s of the tail; fall back to whatever length we have)
+            if self._tail_total_samples > 0:
+                tail = self._concat_tail()
+                tail_len_samples = int(0.6 * SAMPLERATE)
+                tail_sil = tail[-tail_len_samples:] if tail.shape[0] >= tail_len_samples else tail
+                tail_is_silence = (
+                    tail_sil is not None
+                    and tail_sil.shape[0] >= int(0.5 * SAMPLERATE)
+                    and is_silence(tail_sil, threshold_db=_energy_gate_db())
+                )
+            else:
+                tail = None
+                tail_sil = None
+                tail_is_silence = False
 
             # Safety net: stop after 60s of inactivity
             if (time.monotonic() - last_audio_time) > 60.0:
@@ -1911,7 +1980,7 @@ class SpeechSheetApp:
                 if not full_text:
                     # fallback to tail-only decode if recent preview was good
                     recent_preview = (time.monotonic() - getattr(self, "_last_preview_ts", 0.0)) < 3.0
-                    if recent_preview and getattr(self, "_last_preview_text", ""):
+                    if recent_preview and getattr(self, "_last_preview_text", "") and tail is not None:
                         try:
                             alt = transcribe_buffer(tail)
                             alt = strip_trailing_dot(alt)
@@ -1947,6 +2016,7 @@ class SpeechSheetApp:
                 self._tail_total_samples = 0
 
             time.sleep(0.02)  # tight loop for low latency, still cooperative
+
 
     def reset_audio_state(self):
         global audio_queue
@@ -2546,13 +2616,24 @@ class SettingsDialog(tk.Toplevel):
                            bg=c["surface"], fg=c["entry_fg"], insertbackground=c["entry_fg"])
         e_scale.grid(row=7, column=0, sticky="ew", padx=(0,6), pady=(0,10))
 
+        # VAD strictness
+        lab(frm, "VAD Strictness (1=loose, 5=strict)").grid(row=8, column=0, sticky="w", pady=(0,4))
+        cur_vad = int(initial.get("vad_strictness", 3))
+        self.var_vad = tk.IntVar(value=cur_vad)
+        self.sld_vad = tk.Scale(
+            frm, from_=1, to=5, orient="horizontal", variable=self.var_vad,
+            bg=c["bg"], fg=c["text"], troughcolor=c["border"], highlightthickness=0, relief="flat",
+            showvalue=True, length=240
+        )
+        self.sld_vad.grid(row=9, column=0, sticky="w", padx=(0,6), pady=(0,10))
+
         # Speed mode
         self.var_speed = tk.BooleanVar(value=bool(initial.get("speed_mode", False)))
         speed_box = tk.Checkbutton(frm, text="Speed mode (lower latency, may reduce accuracy)",
                                    variable=self.var_speed, bg=c["bg"], fg=c["text"],
                                    activebackground=c["bg"], activeforeground=c["text"],
                                    selectcolor=c.get("surface", "#151a21"))
-        speed_box.grid(row=8, column=0, sticky="w", pady=(4,10))
+        speed_box.grid(row=10, column=0, sticky="w", pady=(4,10))
 
         frm.grid_columnconfigure(0, weight=1)
 
@@ -2600,6 +2681,16 @@ class SettingsDialog(tk.Toplevel):
                 self.on_apply(s)
             finally:
                 self.destroy()
+
+            vad_level = int(self.var_vad.get())
+            s = {
+                "language": lang_code,
+                "autosave_minutes": auto_m,
+                "ui_scale": scale,
+                "model_key": model_key,
+                "vad_strictness": max(1, min(5, vad_level)),
+            }
+
 
         def _reset_widths():
             if callable(self.on_reset_widths):
