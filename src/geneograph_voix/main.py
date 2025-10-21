@@ -74,11 +74,12 @@ _CODE_TO_LABEL = {code: lbl for (lbl, code) in WHISPER_LANG_CHOICES}
 
 # Model picker: UI label ↔ key ↔ faster-whisper name
 MODEL_CHOICES = [
+    ("Tiny",     "tiny"),
     ("Base",     "base"),
     ("Small",    "small"),
     ("Medium",   "medium"),
-    ("Large V3", "large-v3"),
-    ("Turbo",    "turbo"),  # maps to large-v3-turbo
+    ("Large", "large-v3"),
+    ("Turbo",    "large-v3-turbo"), 
 ]
 _MODEL_LABELS = [x[0] for x in MODEL_CHOICES]
 _LABEL_TO_MODELKEY = {lbl: key for (lbl, key) in MODEL_CHOICES}
@@ -86,8 +87,6 @@ _MODELKEY_TO_LABEL = {key: lbl for (lbl, key) in MODEL_CHOICES}
 
 # Map model_key to actual checkpoint id
 def _model_id_for_key(model_key: str) -> str:
-    if model_key == "turbo":
-        return "large-v3-turbo"  # public id
     return model_key
 
 # UI tuning
@@ -131,7 +130,7 @@ BAN_PHRASES = tuple(s.lower() for s in (
     "Dima Torzhok", "DimaTorzok", "DimaTorzhok",
     "Продолжение следует", "Субтитры",
     "Редактор субтитров А.Семкин Корректор А.Егорова",
-    "Редактор субтитров","Редактор", "Спасибо", "Thank you"
+    "Редактор субтитров","Редактор", "Спасибо", "Thank you", "Смотрите На Видео", "Увидимся"
 ))
 MALE_EXCEPTIONS = {
     "акила","арефа","вавила","варнава","иеремия","иона","исая","иуда",
