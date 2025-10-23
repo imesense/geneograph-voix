@@ -380,15 +380,7 @@ def _set_active_template_id(tid: str):
 def _data_path_for_template(tid: str) -> str:
     return os.path.join(DATA_DIR, f"{tid}.csv")
 
-# Glossary lists (global)
-# Structure:
-# {
-#   "lists": {
-#     "<list_id>": { "name": "Family names", "terms": ["Иванов", "Петров"] },
-#     ...
-#   },
-#   "ver": 1
-# }
+
 GLOSSARY_LISTS: dict = {}
 GLOSSARY_VER = 0  # keep using existing version gate
 
@@ -1462,21 +1454,23 @@ class SpeechSheetApp:
         self.add_row_btn = tk.Button(btn_frame, text="➕ Add Rows", command=lambda: self.add_rows(100))
         self.add_row_btn.grid(row=0, column=3, padx=5)
 
+        self.add_col_btn = tk.Button(btn_frame, text="➕ Add Column", command=self.add_column)
+        self.add_col_btn.grid(row=0, column=4, padx=5)
+
         self.clear_btn = tk.Button(btn_frame, text="🧹 Clear All", command=self.clear_all_cells)
-        self.clear_btn.grid(row=0, column=4, padx=5)
+        self.clear_btn.grid(row=0, column=5, padx=5)
 
         self.glossary_btn = tk.Button(btn_frame, text="📚 Glossary", command=self.open_glossary_editor)
-        self.glossary_btn.grid(row=0, column=5, padx=5)
+        self.glossary_btn.grid(row=0, column=6, padx=5)
 
         self.auto_num_btn = tk.Button(btn_frame, text="🔢 Auto Numerate", command=self.auto_numerate)
-        self.auto_num_btn.grid(row=0, column=6, padx=5)
+        self.auto_num_btn.grid(row=0, column=7, padx=5)
 
         self.settings_btn = tk.Button(btn_frame, text="⚙️ Settings", command=self.open_settings)
-        self.settings_btn.grid(row=0, column=7, padx=5)
+        self.settings_btn.grid(row=0, column=8, padx=5)
 
-        # NEW: Template Manager button
         self.template_btn = tk.Button(btn_frame, text="🧩 Templates", command=self.open_template_manager)
-        self.template_btn.grid(row=0, column=8, padx=5)
+        self.template_btn.grid(row=0, column=9, padx=5)
 
         # Preview label
         self.preview_label = tk.Label(
@@ -1502,8 +1496,8 @@ class SpeechSheetApp:
         self.sheet.enable_bindings(("single_select","row_select","column_select","arrowkeys","edit_cell",
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
                                     "copy","cut","paste","delete","undo","double_click_column_resize",
-                                    "double_click_row_resize","rc_insert_column","rc_delete_column",
-                                    "rc_insert_row","rc_delete_row"))
+                                    "double_click_row_resize","rc_delete_column",
+                                    "rc_insert_row","rc_delete_row","edit_header","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"))
 
         root.grid_rowconfigure(2, weight=1)
         root.grid_columnconfigure(0, weight=1)
@@ -1513,6 +1507,20 @@ class SpeechSheetApp:
 
         self._style_action_buttons()
         self.root.after(600, self._style_action_buttons)
+
+        # Status bar (bottom)
+        status_colors = _gfm_palette(True)
+        self.status_frame = tk.Frame(root, bg=status_colors["surface"])
+        self.status_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(0,8))
+        self.template_status_label = tk.Label(
+            self.status_frame,
+            text="",
+            anchor="w",
+            bg=status_colors["surface"],
+            fg=status_colors["muted"]
+        )
+        self.template_status_label.pack(side="left", fill="x", expand=True)
+        self._update_template_status()
 
         # Data
         self.load_data()
@@ -1541,6 +1549,42 @@ class SpeechSheetApp:
             print("Device log error:", _e)
 
     # ------- Template helpers -------
+    def _rebuild_sheet(self, new_headers: list[str], data: list[list[str]]):
+        with self.preserve_column_widths():
+            try:
+                self.sheet.destroy()
+            except Exception:
+                pass
+            self.headers = list(new_headers)
+            self.sheet = Sheet(self.root, headers=self.headers, height=400, width=1000, zoom=TABLE_ZOOM_PCT)
+            self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
+            self.sheet.enable_bindings((
+                "single_select","row_select","column_select","arrowkeys","edit_cell",
+                                    "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
+                                    "copy","cut","paste","delete","undo","double_click_column_resize",
+                                    "double_click_row_resize","rc_delete_column",
+                                    "rc_insert_row","rc_delete_row","edit_header","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"
+            ))
+            self._try_style()
+            self.sheet.set_sheet_data(data)
+            self.load_column_widths()
+
+    def _save_current_state_before_duplicate(self):
+        try:
+            self._persist_column_order_to_template()
+            self.save_data()
+            self.save_column_widths()
+        except Exception as e:
+            print("pre-duplicate save error:", e)
+
+    def _update_template_status(self):
+        try:
+            nm = (self.active_template.get("name") or "(unnamed)") if self.active_template else "—"
+            ident = (self.active_template.get("id","")[:8]) if self.active_template else ""
+            self.template_status_label.config(text=f"Template: {nm} [{ident}]")
+        except Exception:
+            pass
+
     def _reload_templates_cache(self):
         self._templates_cache = _ensure_templates_file(self.headers)
 
@@ -1558,6 +1602,7 @@ class SpeechSheetApp:
         except Exception as e:
             print("save before switch err:", e)
 
+        self._persist_column_order_to_template()
         _set_active_template_id(tid)
         self._reload_templates_cache()
         t = self._get_template_by_id(tid)
@@ -1577,14 +1622,49 @@ class SpeechSheetApp:
         self.sheet.enable_bindings(("single_select","row_select","column_select","arrowkeys","edit_cell",
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
                                     "copy","cut","paste","delete","undo","double_click_column_resize",
-                                    "double_click_row_resize","rc_insert_column","rc_delete_column",
-                                    "rc_insert_row","rc_delete_row"))
+                                    "double_click_row_resize","rc_delete_column",
+                                    "rc_insert_row","rc_delete_row","edit_header","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"))
         self._try_style()
         # Load data for the new template
         self.load_data()
         # Apply template-specific widths
         self.load_column_widths()
         self._flash_preview_note(f"🧩 Switched to template: {t.get('name','(unnamed)')}", ms=1300)
+        self._update_template_status()
+
+    def _current_headers_list(self) -> list[str]:
+        # Try multiple tksheet APIs; fall back to our cached headers
+        try:
+            h = self.sheet.headers()
+            if isinstance(h, (list, tuple)):
+                return [str(x) for x in h]
+        except Exception:
+            pass
+        try:
+            return [str(x) for x in self.sheet.headers]
+        except Exception:
+            pass
+        return list(self.headers)
+
+    def _persist_column_order_to_template(self):
+        """Record current visible column order back into templates.json."""
+        if not self.active_template:
+            return
+        hdrs = self._current_headers_list()
+        self._reload_templates_cache()
+        for t in self._templates_cache.get("templates", []):
+            if t.get("id") == self.active_template.get("id"):
+                existing_cols = t.get("columns", [])
+                by_header = {c["header"]: c for c in existing_cols}
+                new_cols = []
+                for h in hdrs:
+                    col = by_header.get(h)
+                    if col is None:  # column exists in the sheet but not in template yet
+                        col = {"uid": _new_uuid(), "header": h}
+                    new_cols.append(col)
+                t["columns"] = new_cols
+                break
+        _write_templates_file(self._templates_cache)
 
     def _active_mapping(self) -> dict:
         return self.active_template.get("mapping", {}) if self.active_template else {}
@@ -1739,10 +1819,10 @@ class SpeechSheetApp:
         self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
         self.sheet.enable_bindings((
             "single_select","row_select","column_select","arrowkeys","edit_cell",
-            "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
-            "copy","cut","paste","delete","undo",
-            "double_click_column_resize","double_click_row_resize",
-            "rc_insert_column","rc_delete_column","rc_insert_row","rc_delete_row"
+                                    "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
+                                    "copy","cut","paste","delete","undo","double_click_column_resize",
+                                    "double_click_row_resize","rc_delete_column",
+                                    "rc_insert_row","rc_delete_row","edit_header","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"
         ))
         self.sheet.set_sheet_data(data)
         self._try_style()
@@ -1758,6 +1838,41 @@ class SpeechSheetApp:
             self.root.bell()
         except Exception:
             pass
+
+    def add_column(self):
+        name = simpledialog.askstring("Add Column", "Header for the new column:")
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self._current_headers_list():
+            messagebox.showerror("Add Column", f"A column named “{name}” already exists.")
+            return
+
+        # Update template structure
+        if self.active_template:
+            self._reload_templates_cache()
+            for t in self._templates_cache.get("templates", []):
+                if t.get("id") == self.active_template.get("id"):
+                    t.setdefault("columns", []).append({"uid": _new_uuid(), "header": name})
+                    # Extend widths list if present
+                    cw = t.get("column_widths")
+                    if isinstance(cw, list):
+                        cw.append((cw[-1] if cw else 120))
+                    break
+            _write_templates_file(self._templates_cache)
+            self.active_template = _active_template_record()
+
+        # Update visible sheet
+        data = self._get_sheet_data_copy()
+        for row in data:
+            row.append("")
+        new_headers = self._current_headers_list() + [name]
+        self._rebuild_sheet(new_headers, data)
+        self._persist_column_order_to_template()
+        self._update_template_status()
+
 
     def add_text_to_cell(self, text):
         selected = self.sheet.get_selected_cells()
@@ -2299,7 +2414,7 @@ class SpeechSheetApp:
 
     def save_data(self):
         if not self.active_template:
-            # legacy fallback
+            self._persist_column_order_to_template()
             data = self.sheet.get_sheet_data()
             df = pd.DataFrame(data, columns=self.headers)
             df.to_csv(DATA_FILE, index=False, encoding="utf-8-sig", na_rep="")
@@ -2334,6 +2449,7 @@ class SpeechSheetApp:
 
     def save_column_widths(self):
         self._persist_column_widths_to_template()
+        self._persist_column_order_to_template()
 
     def load_column_widths(self):
         # apply template-specific widths
@@ -2364,6 +2480,7 @@ class SpeechSheetApp:
                 try: self.root.after_cancel(self._silence_guard_job)
                 except Exception: pass
                 self._silence_guard_job = None
+            self._persist_column_order_to_template()
             self.save_data()
             self.save_column_widths()
         finally:
@@ -2403,7 +2520,8 @@ class SpeechSheetApp:
     def open_template_manager(self):
         TemplateManagerDialog(
             self.root,
-            on_open=self._set_active_template
+            on_open=self._set_active_template,
+            before_duplicate=self._save_current_state_before_duplicate
         )
 
 
@@ -2435,7 +2553,7 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
             except Exception:
                 pass
 
-        btn_save = tk.Button(topbar, text="💾 Save", command=self._save_all)
+        # btn_save = tk.Button(topbar, text="💾 Save", command=self._save_all)
         btn_close = tk.Button(topbar, text="Save & Close", command=self._on_close)
         for w in (btn_save,):
             _style_btn(w); w.pack(side="left", padx=4, pady=6)
@@ -2482,8 +2600,8 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
                                   highlightthickness=1, highlightbackground=c["border"], relief="flat", height=10)
         self.lb_cols.pack(fill="x")
         map_btns = tk.Frame(right, bg=c["bg"]); map_btns.pack(fill="x", pady=(6,0))
-        b_assign = tk.Button(map_btns, text="⮕ Assign selected list(s)", command=self._assign_lists_to_col)
-        b_clear  = tk.Button(map_btns, text="⨯ Clear mapping for column", command=self._clear_mapping_for_col)
+        b_assign = tk.Button(map_btns, text="Assign selected list", command=self._assign_lists_to_col)
+        b_clear  = tk.Button(map_btns, text="Clear mapping", command=self._clear_mapping_for_col)
         for b in (b_assign, b_clear):
             _style_btn(b); b.pack(side="left", padx=3)
 
@@ -2715,13 +2833,14 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
 # Template Manager Dialog
 # ===========================
 class TemplateManagerDialog(tk.Toplevel):
-    def __init__(self, master, on_open: Callable[[str], None]):
+    def __init__(self, master, on_open: Callable[[str], None], before_duplicate: Optional[Callable[[], None]] = None,):
         super().__init__(master)
         self.title("Templates")
         self.geometry("820x520")
         self.minsize(780, 480)
         self.transient(master)
         self.on_open = on_open
+        self.before_duplicate = before_duplicate
 
         c = _gfm_palette(True)
         self.configure(bg=c["bg"])
@@ -2738,13 +2857,12 @@ class TemplateManagerDialog(tk.Toplevel):
                 pass
 
         self.btn_open = tk.Button(top, text="Open", command=self._open_selected)
-        self.btn_new  = tk.Button(top, text="New (from current headers)", command=self._new_from_current)
         self.btn_dup  = tk.Button(top, text="Duplicate", command=self._duplicate)
         self.btn_ren  = tk.Button(top, text="Rename", command=self._rename)
         self.btn_del  = tk.Button(top, text="Delete", command=self._delete)
         self.btn_imp  = tk.Button(top, text="Import CSV/Excel", command=self._import_template)
 
-        for b in (self.btn_open, self.btn_new, self.btn_dup, self.btn_ren, self.btn_del, self.btn_imp):
+        for b in (self.btn_open, self.btn_dup, self.btn_ren, self.btn_del, self.btn_imp):
             _style_btn(b); b.pack(side="left", padx=4, pady=6)
 
         wrap = tk.Frame(self, bg=c["bg"]); wrap.pack(fill="both", expand=True, padx=10, pady=(0,10))
@@ -2801,24 +2919,9 @@ class TemplateManagerDialog(tk.Toplevel):
         except Exception as e:
             messagebox.showerror("Open template", str(e))
 
-    def _new_from_current(self):
-        # Create a blank template with current headers from the *active template* (not reading sheet)
-        data = _ensure_templates_file([])
-        cur = data.get("last_template_id")
-        headers = []
-        for t in data.get("templates", []):
-            if t.get("id") == cur:
-                headers = [c["header"] for c in t.get("columns", [])]
-                break
-        if not headers:
-            headers = ["Колонка 1", "Колонка 2"]
-        t = _make_default_template(headers)
-        t["name"] = simpledialog.askstring("Template name", "New template name:", initialvalue="New Template") or "New Template"
-        data["templates"].append(t)
-        _write_templates_file(data)
-        self._reload()
-
     def _duplicate(self):
+        if callable(self.before_duplicate):
+            self.before_duplicate()
         data = _ensure_templates_file([])
         tid = self._sel_template_id()
         if not tid:
