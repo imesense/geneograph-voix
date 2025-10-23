@@ -1,6 +1,4 @@
-﻿# --- GeneoGraph VoIx (templates + template manager + global glossary lists + per-column mapping) ---
-
-import threading
+﻿import threading
 import queue
 import time
 import os
@@ -58,18 +56,14 @@ _prepare_frozen_caches()
 # =========================================
 # Global config / settings
 # =========================================
-# (Old data file kept for reference, but per-template path is used below)
-DATA_FILE = "records.csv"
 
 # New files / dirs
-TEMPLATES_FILE = "templates.json"
-GLOSSARIES2_FILE = "glossaries.json"
-DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True)
-
-# Legacy glossary file (not used now, but loader tolerates it)
-GLOSSARY_FILE = "glossary.json"
 SETTINGS_FILE = "settings.json"
+TEMPLATES_FILE = "templates.json"
+GLOSSARIES_FILE = "glossaries.json"
+DATA_DIR = "data"
+DATA_FILE = os.path.join(DATA_DIR, "default.csv")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # Language options
 WHISPER_LANG_CHOICES = [
@@ -172,7 +166,7 @@ def _no_speech_thresholds():
     commit1_nst = {1:0.65, 2:0.62, 3:0.58, 4:0.56, 5:0.54}[l]
     commit2_nst = {1:0.62, 2:0.60, 3:0.56, 4:0.54, 5:0.52}[l]
     cr_preview  = {1:2.40, 2:2.30, 3:2.20, 4:2.10, 5:2.05}[l]
-    cr_commit   = {1:2.20, 2:2.10, 2:2.10, 3:2.00, 4:1.95, 5:1.90}[l]
+    cr_commit   = {1:2.20, 2:2.10, 3:2.00, 4:1.95, 5:1.90}[l]
     return preview_nst, commit1_nst, commit2_nst, cr_preview, cr_commit
 
 # ---------------------------
@@ -382,14 +376,13 @@ def _data_path_for_template(tid: str) -> str:
 
 
 GLOSSARY_LISTS: dict = {}
-GLOSSARY_VER = 0  # keep using existing version gate
 
 def load_glossary_lists():
-    global GLOSSARY_LISTS, GLOSSARY_VER
+    global GLOSSARY_LISTS
     obj = {}
-    if os.path.exists(GLOSSARIES2_FILE):
+    if os.path.exists(GLOSSARIES_FILE):
         try:
-            with open(GLOSSARIES2_FILE, "r", encoding="utf-8") as f:
+            with open(GLOSSARIES_FILE, "r", encoding="utf-8") as f:
                 obj = json.load(f)
         except Exception as e:
             print("glossaries.json load error:", e)
@@ -397,20 +390,14 @@ def load_glossary_lists():
         obj = {}
     if "lists" not in obj:
         obj["lists"] = {}
-    if "ver" not in obj:
-        obj["ver"] = 1
     GLOSSARY_LISTS = obj
-    GLOSSARY_VER = obj.get("ver", 1)
 
 def save_glossary_lists():
-    global GLOSSARY_VER
-    obj = GLOSSARY_LISTS if isinstance(GLOSSARY_LISTS, dict) else {"lists": {}, "ver": 1}
-    obj["ver"] = int(obj.get("ver", 1)) + 1  # bump version to clear caches
-    GLOSSARY_VER = obj["ver"]
-    tmp = os.path.join(os.path.dirname(GLOSSARIES2_FILE) or ".", "~glossaries.tmp.json")
+    obj = GLOSSARY_LISTS if isinstance(GLOSSARY_LISTS, dict) else {"lists": {}}
+    tmp = os.path.join(os.path.dirname(GLOSSARIES_FILE) or ".", "~glossaries.tmp.json")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, GLOSSARIES2_FILE)
+    os.replace(tmp, GLOSSARIES_FILE)
 
 # =========================================
 # Glossary + text utilities (adapted)
@@ -723,10 +710,6 @@ def _clear_best_caches():
     BEST_CACHE_SINGLE.clear()
     BEST_CACHE_MERGE.clear()
 
-def load_glossaries(path: str = GLOSSARY_FILE):
-    # Legacy support: not used by new flow, but we'll parse if present and convert later if needed
-    pass
-
 def _strip_diacritics(s: str) -> str:
     if not s:
         return ""
@@ -754,7 +737,6 @@ CONFUSION_CLASSES = [
     set("бп"), set("вф"), set("гкх"), set("дт"), set("зсц"),
     set("жшщч"),
 ]
-KEYBOARD_NEIGHBORS_RU: dict[str, set[str]] = {}
 VOWELS_RU = set("аеёиоуыэюяіїеaeiouy")
 
 def _is_vowel_ru(ch: str) -> bool:
@@ -823,8 +805,6 @@ def _sub_cost_ru(a: str, b: str) -> float:
         return _WDL_CONF_COST
     if (_is_vowel_ru(a) and _is_vowel_ru(b)):
         return _WDL_VOWEL_COST
-    if b in KEYBOARD_NEIGHBORS_RU.get(a, ()) or a in KEYBOARD_NEIGHBORS_RU.get(b, ()):
-        return _WDL_NEAR_COST
     return _WDL_BASE_COST
 
 @lru_cache(maxsize=32768)
@@ -981,7 +961,7 @@ BEST_CACHE_SINGLE: dict[tuple[str, str, int], tuple[Optional[_Best], Optional[_B
 BEST_CACHE_MERGE: dict[tuple[str, str, int], tuple[Optional[_Best], Optional[_Best]]] = {}
 
 def _best_two_cached(header: str, a_norm: str, g_norm: list[tuple[str, str]], *, is_merge: bool) -> tuple[Optional[_Best], Optional[_Best]]:
-    key = (header, a_norm, GLOSSARY_VER)
+    key = (header, a_norm)
     cache = BEST_CACHE_MERGE if is_merge else BEST_CACHE_SINGLE
     if key in cache:
         return cache[key]
@@ -1497,7 +1477,7 @@ class SpeechSheetApp:
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
                                     "copy","cut","paste","delete","undo","double_click_column_resize",
                                     "double_click_row_resize","rc_delete_column",
-                                    "rc_insert_row","rc_delete_row","edit_header","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"))
+                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"))
 
         root.grid_rowconfigure(2, weight=1)
         root.grid_columnconfigure(0, weight=1)
@@ -1563,7 +1543,7 @@ class SpeechSheetApp:
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
                                     "copy","cut","paste","delete","undo","double_click_column_resize",
                                     "double_click_row_resize","rc_delete_column",
-                                    "rc_insert_row","rc_delete_row","edit_header","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"
+                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"
             ))
             self._try_style()
             self.sheet.set_sheet_data(data)
@@ -1587,6 +1567,15 @@ class SpeechSheetApp:
 
     def _reload_templates_cache(self):
         self._templates_cache = _ensure_templates_file(self.headers)
+
+    def _reload_active_template_from_disk(self):
+        """Reload latest template+mapping from templates.json into the app."""
+        try:
+            self._reload_templates_cache()
+            self.active_template = _active_template_record()
+            self._update_template_status()
+        except Exception as e:
+            print("reload active template error:", e)
 
     def _get_template_by_id(self, tid: str) -> Optional[dict]:
         for t in self._templates_cache.get("templates", []):
@@ -1623,7 +1612,7 @@ class SpeechSheetApp:
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
                                     "copy","cut","paste","delete","undo","double_click_column_resize",
                                     "double_click_row_resize","rc_delete_column",
-                                    "rc_insert_row","rc_delete_row","edit_header","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"))
+                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"))
         self._try_style()
         # Load data for the new template
         self.load_data()
@@ -1631,6 +1620,10 @@ class SpeechSheetApp:
         self.load_column_widths()
         self._flash_preview_note(f"🧩 Switched to template: {t.get('name','(unnamed)')}", ms=1300)
         self._update_template_status()
+        # Clear glossary state/caches after switching templates
+        _clear_best_caches()
+        GLOSSARIES.clear()
+
 
     def _current_headers_list(self) -> list[str]:
         # Try multiple tksheet APIs; fall back to our cached headers
@@ -1822,7 +1815,7 @@ class SpeechSheetApp:
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
                                     "copy","cut","paste","delete","undo","double_click_column_resize",
                                     "double_click_row_resize","rc_delete_column",
-                                    "rc_insert_row","rc_delete_row","edit_header","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"
+                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"
         ))
         self.sheet.set_sheet_data(data)
         self._try_style()
@@ -1927,10 +1920,21 @@ class SpeechSheetApp:
             self.sheet.set_cell_data(row, col, processed)
 
     def open_glossary_editor(self):
+        def _on_glossary_saved():
+            # 1) reload lists (glossaries.json)
+            load_glossary_lists()
+            # 2) reload template (to see fresh mapping)
+            self._reload_active_template_from_disk()
+            # 3) clear caches so new lists/mapping take effect immediately
+            _clear_best_caches()
+            GLOSSARIES.clear()
+            # small UX hint
+            self._flash_preview_note("📚 Glossary & mapping reloaded", ms=1200)
+
         win = GlossaryListsAndMappingDialog(
             self.root,
             active_template=self.active_template,
-            on_saved=lambda: (load_glossary_lists(), _clear_best_caches())
+            on_saved=_on_glossary_saved
         )
         try:
             enable_crisp_dark_mode(win, dark=True, delay_ms=0)
@@ -2131,6 +2135,11 @@ class SpeechSheetApp:
                     _warmup_model()
                 finally:
                     self._hide_loading()
+            try:
+                if int(prev.get("glossary_strictness", 3)) != int(s.get("glossary_strictness", prev.get("glossary_strictness", 3))):
+                    _clear_best_caches()
+            except Exception:
+                pass
 
             self._start_autosave()
         except Exception as e:
@@ -2553,7 +2562,7 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
             except Exception:
                 pass
 
-        # btn_save = tk.Button(topbar, text="💾 Save", command=self._save_all)
+        btn_save = tk.Button(topbar, text="💾 Save", command=self._save_all)
         btn_close = tk.Button(topbar, text="Save & Close", command=self._on_close)
         for w in (btn_save,):
             _style_btn(w); w.pack(side="left", padx=4, pady=6)
