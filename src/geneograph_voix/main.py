@@ -1,4 +1,6 @@
-﻿import threading
+﻿# --- GeneoGraph VoIx (templates + template manager + global glossary lists + per-column mapping) ---
+
+import threading
 import queue
 import time
 import os
@@ -9,6 +11,7 @@ import warnings
 import unicodedata
 import torch
 import inspect
+import uuid
 
 import tkinter as tk
 import numpy as np
@@ -55,7 +58,16 @@ _prepare_frozen_caches()
 # =========================================
 # Global config / settings
 # =========================================
+# (Old data file kept for reference, but per-template path is used below)
 DATA_FILE = "records.csv"
+
+# New files / dirs
+TEMPLATES_FILE = "templates.json"
+GLOSSARIES2_FILE = "glossaries.json"
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Legacy glossary file (not used now, but loader tolerates it)
 GLOSSARY_FILE = "glossary.json"
 SETTINGS_FILE = "settings.json"
 
@@ -79,13 +91,12 @@ MODEL_CHOICES = [
     ("Small",    "small"),
     ("Medium",   "medium"),
     ("Large", "large-v3"),
-    ("Turbo",    "large-v3-turbo"), 
+    ("Turbo",    "large-v3-turbo"),
 ]
 _MODEL_LABELS = [x[0] for x in MODEL_CHOICES]
 _LABEL_TO_MODELKEY = {lbl: key for (lbl, key) in MODEL_CHOICES}
 _MODELKEY_TO_LABEL = {key: lbl for (lbl, key) in MODEL_CHOICES}
 
-# Map model_key to actual checkpoint id
 def _model_id_for_key(model_key: str) -> str:
     return model_key
 
@@ -96,22 +107,22 @@ PREVIEW_CLEAR_DELAY_MS = 1800
 
 # Audio
 SAMPLERATE = 16000
-AUDIO_BLOCK_SEC = 0.10   # capture block size for low latency
-BLOCK_DURATION = 5       # seconds to force a commit if user speaks continuously
+AUDIO_BLOCK_SEC = 0.10
+BLOCK_DURATION = 5
 
 # Preview + speed knobs
-SPEED_MODE = False         # exposed in Settings
+SPEED_MODE = False
 PREVIEW_MIN_INTERVAL_SEC = 0.35
 PREVIEW_TAIL_SEC_DEFAULT = 0.60
 PREVIEW_TAIL_SEC_SPEED   = 0.50
 
-COMMIT_TAIL_SILENCE_SEC = 0.60   # tail to deem “quiet enough” for commit
-COMMIT_MIN_SILENCE_SEC  = 0.50   # require at least 0.90s of tail available for the silence test
+COMMIT_TAIL_SILENCE_SEC = 0.60
+COMMIT_MIN_SILENCE_SEC  = 0.50
 
 def _preview_tail_sec() -> float:
     return PREVIEW_TAIL_SEC_SPEED if SPEED_MODE else PREVIEW_TAIL_SEC_DEFAULT
 
-APPEND_MODE = False # Append mode (when True, append instead of replace on commit)
+APPEND_MODE = False  # Append mode (append instead of replace on commit)
 
 # Autosave
 AUTOSAVE_EVERY_MS = 5 * 60 * 1000   # 5 minutes
@@ -140,13 +151,8 @@ MALE_EXCEPTIONS = {
 # ---------------------------
 # Dynamic VAD strictness (1..5)
 # ---------------------------
-VAD_STRICTNESS = 3  # default mid; 1=loose, 5=strict
-
+VAD_STRICTNESS = 3
 def _silero_params_for(level: int):
-    """
-    Map strictness -> Silero params (threshold, min_speech, min_silence, pad)
-    and energy gate (RMS dB floor). Higher = stricter.
-    """
     level = int(max(1, min(5, level)))
     table = {
         1: dict(th=0.30, min_speech=80,  min_silence=150, pad=200, energy_db=-52.0),
@@ -161,40 +167,28 @@ def _energy_gate_db() -> float:
     return _silero_params_for(VAD_STRICTNESS)["energy_db"]
 
 def _no_speech_thresholds():
-    """
-    Preview/commit thresholds tuned by strictness.
-    Lower numbers = easier to discard silence (stricter).
-    Returns: (preview_nst, commit_pass1_nst, commit_pass2_nst, cr_preview, cr_commit)
-    """
     l = int(max(1, min(5, VAD_STRICTNESS)))
     preview_nst = {1:0.70, 2:0.65, 3:0.60, 4:0.58, 5:0.55}[l]
     commit1_nst = {1:0.65, 2:0.62, 3:0.58, 4:0.56, 5:0.54}[l]
     commit2_nst = {1:0.62, 2:0.60, 3:0.56, 4:0.54, 5:0.52}[l]
     cr_preview  = {1:2.40, 2:2.30, 3:2.20, 4:2.10, 5:2.05}[l]
-    cr_commit   = {1:2.20, 2:2.10, 3:2.00, 4:1.95, 5:1.90}[l]
+    cr_commit   = {1:2.20, 2:2.10, 2:2.10, 3:2.00, 4:1.95, 5:1.90}[l]
     return preview_nst, commit1_nst, commit2_nst, cr_preview, cr_commit
 
 # ---------------------------
-# Glossary correction strictness (1..5)
+# Glossary strictness (1..5)
 # ---------------------------
-GLOSSARY_STRICTNESS = 3  # 1 = loose (more willing to auto-correct), 5 = strict (very conservative)
+GLOSSARY_STRICTNESS = 3
 
 def _glossary_thresholds(L: int, level: int | None = None):
-    """
-    Dynamic thresholds for glossary correction.
-    Higher level => more aggressive corrections (useful for tiny/base models).
-    Returns: (max_edits, min_dice, req_anchor, score_gap)
-    """
     level = int(max(1, min(5, level if level is not None else GLOSSARY_STRICTNESS)))
-    base_ed  = _len_aware_max_edits(L)          # length-aware rough edits allowance
-    base_d   = _min_dice_for_len(L)             # length-aware minimum Dice similarity
-    # Aggressiveness maps
-    ed_bonus = {1:0.3, 2:0.5, 3:0.7, 4:1.0, 5:1.4}[level]   # allow more edits as level grows
-    dice_adj = {1:+0.06, 2:+0.03, 3:0.00, 4:-0.05, 5:-0.10}[level]  # relax min dice at higher levels
+    base_ed  = _len_aware_max_edits(L)
+    base_d   = _min_dice_for_len(L)
+    ed_bonus = {1:0.3, 2:0.5, 3:0.7, 4:1.0, 5:1.4}[level]
+    dice_adj = {1:+0.06, 2:+0.03, 3:0.00, 4:-0.05, 5:-0.10}[level]
     anchor_base = 2 if L <= 5 else 3
-    anchor_adj  = {1:0, 2:0, 3:0, 4:-1, 5:-1}[level]        # require slightly less anchoring at high levels
-    score_gap   = {1:0.40, 2:0.38, 3:0.35, 4:0.22, 5:0.15}[level]   # how much better the winner must be
-
+    anchor_adj  = {1:0, 2:0, 3:0, 4:-1, 5:-1}[level]
+    score_gap   = {1:0.40, 2:0.38, 3:0.35, 4:0.22, 5:0.15}[level]
     max_ed   = base_ed + ed_bonus
     min_d    = max(0.0, min(0.95, base_d + dice_adj))
     req_anchor = max(1, anchor_base + anchor_adj)
@@ -207,18 +201,14 @@ warnings.filterwarnings("ignore")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def _detect_physical_cores() -> Optional[int]:
-    """Best-effort physical core count without requiring psutil."""
-    # 1) Try psutil via dynamic import (no Pylance warning; safe if missing)
     try:
         import importlib
-        psutil = importlib.import_module("psutil")  # optional dep
+        psutil = importlib.import_module("psutil")
         n = psutil.cpu_count(logical=False) or 0
         if n > 0:
             return int(n)
     except Exception:
         pass
-
-    # 2) Windows WMIC fallback
     try:
         if sys.platform.startswith("win"):
             import subprocess
@@ -228,8 +218,6 @@ def _detect_physical_cores() -> Optional[int]:
                 return sum(nums)
     except Exception:
         pass
-
-    # 3) Linux fallback via lscpu (counts unique core IDs)
     try:
         if sys.platform.startswith("linux"):
             import subprocess
@@ -245,8 +233,6 @@ def _detect_physical_cores() -> Optional[int]:
                 return len(ids)
     except Exception:
         pass
-
-    # 4) Last resort: logical cores (not physical, but better than None)
     try:
         n = os.cpu_count()
         return int(n) if n else None
@@ -257,23 +243,15 @@ CPU_THREADS: Optional[int] = None
 NUM_WORKERS: Optional[int] = None
 _physical = _detect_physical_cores()
 if _physical:
-    # Keep it modest to avoid starving UI
     CPU_THREADS = max(2, min(_physical, 8))
     NUM_WORKERS = 1
-    # Only set env if user didn't
     os.environ.setdefault("OMP_NUM_THREADS", str(CPU_THREADS))
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 def _resolve_compute_type(device: str) -> Tuple[List[str], str]:
-    """
-    Returns (fallback_chain, initial_picked_string)
-    CPU: prefer int8 -> float32
-    CUDA: prefer float16 -> int8_float16 -> float32
-    """
     env_ct = os.getenv("WHISPER_COMPUTE_TYPE") or os.getenv("FAST_WHISPER_COMPUTE_TYPE")
     if env_ct:
         return [env_ct], env_ct
-
     if device == "cuda":
         chain = ["float16", "int8_float16", "float32"]
         return chain, chain[0]
@@ -284,8 +262,8 @@ def _resolve_compute_type(device: str) -> Tuple[List[str], str]:
 # =========================================
 # Settings helpers
 # =========================================
-LANGUAGE = "ru"  # may be overridden by settings
-MODEL_KEY = None # decided from settings or default per device
+LANGUAGE = "ru"
+MODEL_KEY = None
 
 def _read_settings_from_file() -> dict:
     try:
@@ -339,7 +317,111 @@ def _save_settings_file(s: dict):
         print("settings save error:", e)
 
 # =========================================
-# Glossary + text utilities (unchanged core logic)
+# Templates & Global Glossary lists
+# =========================================
+
+def _new_uuid() -> str:
+    return uuid.uuid4().hex
+
+def _make_default_template(headers: List[str]) -> dict:
+    return {
+        "id": _new_uuid(),
+        "name": "Default",
+        "columns": [{"uid": _new_uuid(), "header": h} for h in headers],
+        "mapping": {},               # column_uid -> [list_id, ...]
+        "column_widths": None        # optional list of ints
+    }
+
+def _ensure_templates_file(default_headers: List[str]) -> dict:
+    data = {}
+    if os.path.exists(TEMPLATES_FILE):
+        try:
+            with open(TEMPLATES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            print("templates load error:", e)
+    if not isinstance(data, dict):
+        data = {}
+    if "templates" not in data or not isinstance(data.get("templates"), list) or not data["templates"]:
+        # create default
+        t = _make_default_template(default_headers)
+        data = {"last_template_id": t["id"], "templates": [t]}
+        _write_templates_file(data)
+    return data
+
+def _write_templates_file(obj: dict):
+    tmp = os.path.join(os.path.dirname(TEMPLATES_FILE) or ".", "~templates.tmp.json")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, TEMPLATES_FILE)
+
+def _active_template_record() -> Optional[dict]:
+    data = _ensure_templates_file(default_headers=[
+        "№","№ М","№ Ж","Дата","Имя","Фамилия","Имя отца","Имя матери","Восприемник","Страница","Комментарий"
+    ])
+    tid = data.get("last_template_id")
+    for t in data.get("templates", []):
+        if t.get("id") == tid:
+            return t
+    # fallback to first
+    if data.get("templates"):
+        data["last_template_id"] = data["templates"][0]["id"]
+        _write_templates_file(data)
+        return data["templates"][0]
+    return None
+
+def _set_active_template_id(tid: str):
+    data = _ensure_templates_file(default_headers=[
+        "№","№ М","№ Ж","Дата","Имя","Фамилия","Имя отца","Имя матери","Восприемник","Страница","Комментарий"
+    ])
+    data["last_template_id"] = tid
+    _write_templates_file(data)
+
+def _data_path_for_template(tid: str) -> str:
+    return os.path.join(DATA_DIR, f"{tid}.csv")
+
+# Glossary lists (global)
+# Structure:
+# {
+#   "lists": {
+#     "<list_id>": { "name": "Family names", "terms": ["Иванов", "Петров"] },
+#     ...
+#   },
+#   "ver": 1
+# }
+GLOSSARY_LISTS: dict = {}
+GLOSSARY_VER = 0  # keep using existing version gate
+
+def load_glossary_lists():
+    global GLOSSARY_LISTS, GLOSSARY_VER
+    obj = {}
+    if os.path.exists(GLOSSARIES2_FILE):
+        try:
+            with open(GLOSSARIES2_FILE, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+        except Exception as e:
+            print("glossaries.json load error:", e)
+    if not isinstance(obj, dict):
+        obj = {}
+    if "lists" not in obj:
+        obj["lists"] = {}
+    if "ver" not in obj:
+        obj["ver"] = 1
+    GLOSSARY_LISTS = obj
+    GLOSSARY_VER = obj.get("ver", 1)
+
+def save_glossary_lists():
+    global GLOSSARY_VER
+    obj = GLOSSARY_LISTS if isinstance(GLOSSARY_LISTS, dict) else {"lists": {}, "ver": 1}
+    obj["ver"] = int(obj.get("ver", 1)) + 1  # bump version to clear caches
+    GLOSSARY_VER = obj["ver"]
+    tmp = os.path.join(os.path.dirname(GLOSSARIES2_FILE) or ".", "~glossaries.tmp.json")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, GLOSSARIES2_FILE)
+
+# =========================================
+# Glossary + text utilities (adapted)
 # =========================================
 def _preview_is_banned(text: str) -> bool:
     try:
@@ -365,7 +447,6 @@ audio_queue = queue.Queue()
 def audio_callback(indata, frames, time_info, status):
     if status:
         print("⚠️", status)
-    # Update last activity (silence guard): consider any incoming frame as activity
     global LAST_ACTIVITY_TS
     try:
         x = np.asarray(indata, dtype=np.float32)
@@ -408,7 +489,6 @@ def _load_silero_vad():
         (_get_speech_ts, *_rest) = _silero_utils
         _silero_model.to(_silero_device)
         _silero_model.eval()
-        # keep PyTorch from hogging CPU threads if VAD is on CPU
         if _silero_device == "cpu":
             try:
                 torch.set_num_threads(1)
@@ -437,7 +517,7 @@ def _silero_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> Optional[np.n
         return None
     start = ts[0]["start"]; end = ts[-1]["end"]
     trimmed = buf_f32[start:end]
-    if len(trimmed) < int(sr * 0.20):  # bump to 200 ms to be safer
+    if len(trimmed) < int(sr * 0.20):
         return None
     return trimmed
 
@@ -448,7 +528,6 @@ model: Optional[WhisperModel] = None
 COMPUTE_TYPE = None
 
 def _pick_default_model_key() -> str:
-    # CPU → small ; CUDA → turbo (large-v3-turbo)
     return "large-v3-turbo" if device == "cuda" else "small"
 
 def _load_whisper_model(model_key: str):
@@ -476,15 +555,10 @@ def _warmup_model():
         print("Warmup failed (non-fatal):", e)
 
 def fw_transcribe(audio, **kwargs):
-    """
-    Call faster-whisper's transcribe() with only supported kwargs.
-    Also inject auto threading args if available.
-    """
     if CPU_THREADS is not None:
         kwargs.setdefault("cpu_threads", CPU_THREADS)
     if NUM_WORKERS is not None:
         kwargs.setdefault("num_workers", NUM_WORKERS)
-
     params = inspect.signature(model.transcribe).parameters
     safe_kwargs = {k: v for k, v in kwargs.items() if k in params}
     return model.transcribe(audio, **safe_kwargs)
@@ -528,12 +602,11 @@ def strip_trailing_dot(text: str) -> str:
     return s
 
 # ===========================
-# Decoding functions (faster settings)
+# Decoding functions
 # ===========================
 def transcribe_buffer(buffer):
     if buffer.size == 0:
         return ""
-    # quick energy gate
     if rms_db(buffer.flatten()) < (_energy_gate_db() + 2.0):
         return ""
     prev_nst, _, _, cr_prev, _ = _no_speech_thresholds()
@@ -552,15 +625,10 @@ def transcribe_buffer(buffer):
 def transcribe_buffer_commit(buffer):
     if buffer is None or buffer.size == 0:
         return ""
-
     mono = buffer[:, 0] if getattr(buffer, "ndim", 0) > 1 else buffer
     mono = np.asarray(mono, dtype=np.float32, order="C")
-
-    # Energy gate: don't even try if below floor
     if rms_db(mono) < _energy_gate_db():
         return ""
-
-    # Trim with Silero if available
     trimmed = mono
     try:
         if _has_silero:
@@ -574,17 +642,12 @@ def transcribe_buffer_commit(buffer):
                     return ""
     except Exception:
         pass
-
-    # pre-emphasis
     if trimmed.shape[0] > 1:
         x = trimmed.copy()
         x[1:] = x[1:] - 0.97 * x[:-1]
         trimmed = x
-
     samples = trimmed.flatten()
     prev_nst, commit1_nst, commit2_nst, _, cr_commit = _no_speech_thresholds()
-
-    # First pass (stricter than before)
     segments, info = fw_transcribe(
         samples,
         language=_effective_language(),
@@ -595,11 +658,9 @@ def transcribe_buffer_commit(buffer):
         no_speech_threshold=commit1_nst,
         compression_ratio_threshold=cr_commit,
     )
-
     segs = list(segments)
     full_text = " ".join((s.text or "").strip() for s in segs).strip()
 
-    # quick hallucination filters
     def _seg_suspicious(seg) -> bool:
         try:
             cr  = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
@@ -620,7 +681,6 @@ def transcribe_buffer_commit(buffer):
             suspicious = True
 
     if suspicious:
-        # Retry with slightly different thresholds
         segments2, info2 = fw_transcribe(
             samples,
             language=_effective_language(),
@@ -650,50 +710,30 @@ def transcribe_buffer_commit(buffer):
             return ""
         full_text = alt
 
-    # “music” hallucination veto (short, low-info lines)
     low = (full_text or "").lower()
     if len(low) <= 24 and any(w in low for w in ("музык", "аплодисмент", "барабан", "спасибо")):
         return ""
-
     try:
         full_text = strip_trailing_dot(full_text)
     except Exception:
         pass
     return full_text
 
+# ===========================
+# Glossary correction engine (same logic; now applicable to any mapped column)
+# ===========================
+# We keep all original helpers below; the key change is we REMOVED the early gate
+# "if header not in NAME_COLUMNS: return text" so mapped non-name columns can use lists.
 
-# ===========================
-# Glossary correction (full logic retained)
-# ===========================
-GLOSSARIES = {}
-GLOSSARY_VER = 0
-BEST_CACHE_SINGLE: dict[tuple[str, str, int], tuple[Optional["_Best"], Optional["_Best"]]] = {}
-BEST_CACHE_MERGE: dict[tuple[str, str, int], tuple[Optional["_Best"], Optional["_Best"]]] = {}
+GLOSSARIES = {}  # dynamic per-column synthetic key: "col:<uid>" -> [terms]
 
 def _clear_best_caches():
     BEST_CACHE_SINGLE.clear()
     BEST_CACHE_MERGE.clear()
 
 def load_glossaries(path: str = GLOSSARY_FILE):
-    global GLOSSARY_VER
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                norm = {}
-                for k, v in data.items():
-                    if isinstance(v, list):
-                        norm[k] = [str(x) for x in v]
-                    elif isinstance(v, dict):
-                        norm[k] = [str(x) for x in v.keys()]
-                if norm:
-                    GLOSSARIES.clear()
-                    GLOSSARIES.update(norm)
-                    GLOSSARY_VER += 1
-                    _clear_best_caches()
-    except Exception as e:
-        print("Glossary load error:", e)
+    # Legacy support: not used by new flow, but we'll parse if present and convert later if needed
+    pass
 
 def _strip_diacritics(s: str) -> str:
     if not s:
@@ -908,13 +948,10 @@ def _best_two_candidates(a_norm: str, g_norm: list[tuple[str, str]]) -> tuple[Op
             return False
         if a_ch == b_ch:
             return True
-        # Soft/hard sign at the end: don't block
         if is_last and (a_ch in "ьъ" or b_ch in "ьъ"):
             return True
-        # Consonant confusion classes (б/п, д/т, ж/ш/щ/ч, ...)
         if _same_confusion_class(a_ch, b_ch):
             return True
-        # Vowels frequently wobble in speech (о/у/а/э/и/ы/я/ю/е/ё/і/ї/є)
         if _is_vowel_ru(a_ch) and _is_vowel_ru(b_ch):
             return True
         return False
@@ -935,7 +972,7 @@ def _best_two_candidates(a_norm: str, g_norm: list[tuple[str, str]]) -> tuple[Op
         lcs  = _lcs_len(a_norm, b)
         wdl  = _wdl(a_norm, b)
         phon = _wdl(ru_phon_key(a_norm), ru_phon_key(b))
-        cand = _Best(orig=orig, norm=b, d=d_lev, dice=dice, lcp=lcp, lcs=lcs, wdl=wdl, phon=phon)
+        cand = _Best(orig=orig, norm=b, d=dice, dice=dice, lcp=lcp, lcs=lcs, wdl=wdl, phon=phon)
 
         def better(x: _Best, y: _Best) -> bool:
             if x.wdl != y.wdl: return x.wdl < y.wdl
@@ -947,6 +984,9 @@ def _best_two_candidates(a_norm: str, g_norm: list[tuple[str, str]]) -> tuple[Op
         elif second is None or better(cand, second):
             second = cand
     return best, second
+
+BEST_CACHE_SINGLE: dict[tuple[str, str, int], tuple[Optional[_Best], Optional[_Best]]] = {}
+BEST_CACHE_MERGE: dict[tuple[str, str, int], tuple[Optional[_Best], Optional[_Best]]] = {}
 
 def _best_two_cached(header: str, a_norm: str, g_norm: list[tuple[str, str]], *, is_merge: bool) -> tuple[Optional[_Best], Optional[_Best]]:
     key = (header, a_norm, GLOSSARY_VER)
@@ -960,7 +1000,6 @@ def _best_two_cached(header: str, a_norm: str, g_norm: list[tuple[str, str]], *,
 def _should_correct_from_norm(a_norm: str, best: Optional[_Best], runner_up: Optional[_Best]) -> bool:
     if not best or not a_norm:
         return False
-
     L = max(len(a_norm), len(best.norm))
     wdl  = best.wdl
     dice = best.dice
@@ -969,62 +1008,51 @@ def _should_correct_from_norm(a_norm: str, best: Optional[_Best], runner_up: Opt
 
     max_ed, min_d, req_anchor, score_gap = _glossary_thresholds(L, GLOSSARY_STRICTNESS)
 
-    # Consonant-skeleton rescue for voice: high when (рс л) matches even if vowels/ь differ
     sk_a = _cons_skeleton(a_norm)
     sk_b = _cons_skeleton(best.norm)
     sk_dice = _dice_sim(sk_a, sk_b) if sk_a and sk_b else 0.0
     sk_len  = max(len(sk_a), len(sk_b))
 
-    # If phonetics are very close, slightly relax Dice
     if dice < min_d and phon <= 1.0:
         min_d -= 0.05
-
-    # If skeleton is strong, relax Dice at higher levels
     if GLOSSARY_STRICTNESS >= 4 and sk_len >= 3 and sk_dice >= 0.80:
         min_d = min(min_d, 0.50)
 
-    # Basic gates
-    if wdl > max_ed:        return False
-    if dice < min_d:        # might still pass under aggressive rules below
-        pass
-    else:
-        if anchor >= req_anchor:
-            return True
+    if wdl > max_ed:
+        return False
+    if dice >= min_d and anchor >= req_anchor:
+        return True
 
-    # No runner-up? accept if other signals are strong
     if runner_up is None:
         return (anchor >= req_anchor) or (GLOSSARY_STRICTNESS >= 4 and sk_len >= 3 and sk_dice >= 0.80 and wdl <= (max_ed + 0.2))
 
-    # Compare combined scores (lower is better)
     score_best, _, _, _ = _combined_score(a_norm, best.norm)
     score_run , _, _, _ = _combined_score(a_norm, runner_up.norm)
     if (score_run - score_best) >= score_gap and anchor >= max(1, req_anchor - 1):
         return True
 
-    # Aggressive voice-specific acceptance at high levels
     if GLOSSARY_STRICTNESS >= 4:
-        # Small edit distance + strong anchoring OR strong skeleton
         if (_lev(a_norm, best.norm) <= 2 and max(best.lcp, best.lcs) >= (L - 2)):
             return True
         if sk_len >= 3 and sk_dice >= 0.85 and _lev(sk_a, sk_b) <= 1:
             return True
-        # Terminal soft sign noise
         if _trim_soft(a_norm) == _trim_soft(best.norm) and _lev(a_norm, best.norm) <= 2:
             return True
-
     return False
 
 def _should_correct(token: str, best: Optional[_Best], runner_up: Optional[_Best]) -> bool:
     a_norm = _ru_norm(token)
     return _should_correct_from_norm(a_norm, best, runner_up)
 
-def correct_text_for_column(text: str, header: str) -> str:
+def correct_text_for_column(text: str, header_key: str) -> str:
+    """
+    Apply glossary correction if GLOSSARIES[header_key] exists and has terms.
+    Unlike the old version, we don't limit this to NAME columns only —
+    we allow any column that has mapped lists.
+    """
     if not text:
         return ""
-    if header not in NAME_COLUMNS:
-        return text
-
-    glossary = GLOSSARIES.get(header) or []
+    glossary = GLOSSARIES.get(header_key) or []
     if not glossary:
         return text
 
@@ -1053,7 +1081,7 @@ def correct_text_for_column(text: str, header: str) -> str:
             joined2 = tok + tok2
             a_join2 = _ru_norm_merge(joined2)
             if a_join2:
-                bestm2, runnerm2 = _best_two_cached(header, a_join2, g_norm_merge, is_merge=True)
+                bestm2, runnerm2 = _best_two_cached(header_key, a_join2, g_norm_merge, is_merge=True)
                 if _should_correct_from_norm(a_join2, bestm2, runnerm2):
                     if len(a_join2) >= 5 and (bestm2.lcp >= 3 or bestm2.lcs >= 3):
                         cand2 = (bestm2, _score_from_norm(a_join2, bestm2))
@@ -1064,7 +1092,7 @@ def correct_text_for_column(text: str, header: str) -> str:
             joined123 = tok + tok2 + tok3
             a_join123 = _ru_norm_merge(joined123)
             if a_join123:
-                bestm3a, runnerm3a = _best_two_cached(header, a_join123, g_norm_merge, is_merge=True)
+                bestm3a, runnerm3a = _best_two_cached(header_key, a_join123, g_norm_merge, is_merge=True)
                 if _should_correct_from_norm(a_join123, bestm3a, runnerm3a):
                     if len(a_join123) >= 6 and (bestm3a.lcp >= 3 or bestm3a.lcs >= 3):
                         cand3 = (bestm3a, _score_from_norm(a_join123, bestm3a))
@@ -1073,7 +1101,7 @@ def correct_text_for_column(text: str, header: str) -> str:
                 joined13 = tok + tok3
                 a_join13 = _ru_norm_merge(joined13)
                 if a_join13:
-                    bestm3b, runnerm3b = _best_two_cached(header, a_join13, g_norm_merge, is_merge=True)
+                    bestm3b, runnerm3b = _best_two_cached(header_key, a_join13, g_norm_merge, is_merge=True)
                     if _should_correct_from_norm(a_join13, bestm3b, runnerm3b):
                         if len(a_join13) >= 6 and (bestm3b.lcp >= 3 or bestm3b.lcs >= 3):
                             cand3 = (bestm3b, _score_from_norm(a_join13, bestm3b))
@@ -1083,14 +1111,14 @@ def correct_text_for_column(text: str, header: str) -> str:
             ok1 = ok2 = False
             score1 = score2 = float("inf")
             if a:
-                best1, runner1 = _best_two_cached(header, a, g_norm, is_merge=False)
+                best1, runner1 = _best_two_cached(header_key, a, g_norm, is_merge=False)
                 ok1 = _should_correct(tok, best1, runner1)
                 if ok1 and best1:
                     score1 = _score_from_norm(a, best1)
             if i + 1 < len(tokens):
                 a2 = _ru_norm(tokens[i + 1])
                 if a2:
-                    best2, runner2 = _best_two_cached(header, a2, g_norm, is_merge=False)
+                    best2, runner2 = _best_two_cached(header_key, a2, g_norm, is_merge=False)
                     ok2 = _should_correct(tokens[i + 1], best2, runner2)
                     if ok2 and best2:
                         score2 = _score_from_norm(a2, best2)
@@ -1101,7 +1129,7 @@ def correct_text_for_column(text: str, header: str) -> str:
                 continue
 
         if a:
-            best, runner = _best_two_cached(header, a, g_norm, is_merge=False)
+            best, runner = _best_two_cached(header_key, a, g_norm, is_merge=False)
             if _should_correct(tok, best, runner):
                 out.append(best.orig)
             else:
@@ -1316,32 +1344,20 @@ def _style_ttk(dark=True):
         style.theme_use("clam")
     except Exception:
         pass
-
     c = _gfm_palette(dark)
     style.configure(".", background=c["bg"], foreground=c["text"])
     style.configure("TFrame", background=c["bg"])
     style.configure("TLabel", background=c["bg"], foreground=c["text"])
     style.configure("TEntry", fieldbackground=c["surface"], foreground=c["entry_fg"], bordercolor=c["border"])
     style.map("TEntry", fieldbackground=[("disabled", c["button_disabled_bg"])], foreground=[("disabled", c["button_disabled_fg"])])
-    style.configure(
-        "Settings.TCombobox",
-        background=c["surface"],
-        fieldbackground=c["surface"],
-        foreground=c["entry_fg"],
-        bordercolor=c["border"],
-        lightcolor=c["border"],
-        darkcolor=c["border"],
-    )
-    style.map(
-        "Settings.TCombobox",
-        fieldbackground=[
-            ("readonly", c["surface"]),
-            ("!disabled", c["surface"]),
-        ],
-        foreground=[("readonly", c["entry_fg"])],
-        selectbackground=[("readonly", c["sel_bg"])],
-        selectforeground=[("readonly", c["sel_fg"])],
-    )
+    style.configure("Settings.TCombobox",
+                    background=c["surface"], fieldbackground=c["surface"], foreground=c["entry_fg"],
+                    bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"])
+    style.map("Settings.TCombobox",
+              fieldbackground=[("readonly", c["surface"]), ("!disabled", c["surface"])],
+              foreground=[("readonly", c["entry_fg"])],
+              selectbackground=[("readonly", c["sel_bg"])],
+              selectforeground=[("readonly", c["sel_fg"])])
 
 def _try_style_tksheet(root: "tk.Tk", dark=True):
     try:
@@ -1402,6 +1418,24 @@ class SpeechSheetApp:
         self.root.title("GeneoGraph VoIx")
         self.is_listening = False
 
+        # Load glossary lists
+        load_glossary_lists()
+
+        # Template bootstrap (create default if none)
+        default_headers = ["№","№ М","№ Ж","Дата","Имя","Фамилия","Имя отца",
+                           "Имя матери","Восприемник","Страница","Комментарий"]
+        self._templates_cache = _ensure_templates_file(default_headers)
+        self.active_template = _active_template_record()
+        if not self.active_template:
+            # should not happen; ensure one exists
+            t = _make_default_template(default_headers)
+            self._templates_cache = {"last_template_id": t["id"], "templates": [t]}
+            _write_templates_file(self._templates_cache)
+            self.active_template = t
+
+        # build headers from active template
+        self.headers = [col["header"] for col in self.active_template["columns"]]
+
         self._autosave_job = None
         self._last_autosave_ok = True
         self._start_autosave()
@@ -1440,6 +1474,10 @@ class SpeechSheetApp:
         self.settings_btn = tk.Button(btn_frame, text="⚙️ Settings", command=self.open_settings)
         self.settings_btn.grid(row=0, column=7, padx=5)
 
+        # NEW: Template Manager button
+        self.template_btn = tk.Button(btn_frame, text="🧩 Templates", command=self.open_template_manager)
+        self.template_btn.grid(row=0, column=8, padx=5)
+
         # Preview label
         self.preview_label = tk.Label(
             root,
@@ -1452,13 +1490,9 @@ class SpeechSheetApp:
         self._preview_clear_after = None
 
         # Sheet
-        self.headers = ["№","№ М","№ Ж","Дата","Имя","Фамилия","Имя отца",
-                        "Имя матери","Восприемник","Страница","Комментарий"]
-        load_glossaries()
-
         self.sheet = Sheet(root, headers=self.headers, height=400, width=1000, zoom=TABLE_ZOOM_PCT)
 
-        # Column widths
+        # Column widths (per-template)
         try:
             self.load_column_widths()
         except Exception as e:
@@ -1505,6 +1539,83 @@ class SpeechSheetApp:
                 print("[CUDA] device name:", torch.cuda.get_device_name(0))
         except Exception as _e:
             print("Device log error:", _e)
+
+    # ------- Template helpers -------
+    def _reload_templates_cache(self):
+        self._templates_cache = _ensure_templates_file(self.headers)
+
+    def _get_template_by_id(self, tid: str) -> Optional[dict]:
+        for t in self._templates_cache.get("templates", []):
+            if t.get("id") == tid:
+                return t
+        return None
+
+    def _set_active_template(self, tid: str):
+        # Save current data + widths first
+        try:
+            self.save_data()
+            self.save_column_widths()
+        except Exception as e:
+            print("save before switch err:", e)
+
+        _set_active_template_id(tid)
+        self._reload_templates_cache()
+        t = self._get_template_by_id(tid)
+        if not t:
+            messagebox.showerror("Templates", "Template not found.")
+            return
+        self.active_template = t
+        self.headers = [col["header"] for col in t["columns"]]
+        # Recreate sheet with new headers but keep row count
+        data = self._get_sheet_data_copy()
+        try:
+            self.sheet.destroy()
+        except Exception:
+            pass
+        self.sheet = Sheet(self.root, headers=self.headers, height=400, width=1000, zoom=TABLE_ZOOM_PCT)
+        self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
+        self.sheet.enable_bindings(("single_select","row_select","column_select","arrowkeys","edit_cell",
+                                    "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
+                                    "copy","cut","paste","delete","undo","double_click_column_resize",
+                                    "double_click_row_resize","rc_insert_column","rc_delete_column",
+                                    "rc_insert_row","rc_delete_row"))
+        self._try_style()
+        # Load data for the new template
+        self.load_data()
+        # Apply template-specific widths
+        self.load_column_widths()
+        self._flash_preview_note(f"🧩 Switched to template: {t.get('name','(unnamed)')}", ms=1300)
+
+    def _active_mapping(self) -> dict:
+        return self.active_template.get("mapping", {}) if self.active_template else {}
+
+    def _column_uid_for_index(self, col_index: int) -> Optional[str]:
+        try:
+            return self.active_template["columns"][col_index]["uid"]
+        except Exception:
+            return None
+
+    def _lists_terms_for_column_uid(self, col_uid: str) -> List[str]:
+        if not col_uid:
+            return []
+        mapping = self._active_mapping()
+        list_ids = mapping.get(col_uid, [])
+        out: List[str] = []
+        lists = GLOSSARY_LISTS.get("lists", {})
+        for lid in list_ids:
+            lst = lists.get(lid)
+            if not lst:
+                continue
+            terms = lst.get("terms", [])
+            out.extend([str(x) for x in terms if isinstance(x, str) and x.strip()])
+        # de-dup while preserving order
+        seen = set(); uniq = []
+        for t in out:
+            k = t.lower()
+            if k in seen:
+                continue
+            seen.add(k); uniq.append(t)
+        return uniq
 
     # ------- Preview flash -------
     def _flash_preview_note(self, msg: str, ms: int = 1200):
@@ -1584,46 +1695,34 @@ class SpeechSheetApp:
             rows = len(self.sheet.get_sheet_data())
             self.sheet.set_sheet_data([[""] * len(self.headers) for _ in range(rows)])
 
-    def _persist_column_widths_to_settings(self):
+    # --- Persist column widths per template ---
+    def _persist_column_widths_to_template(self):
+        widths = None
         try:
             if hasattr(self.sheet, "get_column_widths"):
                 widths = self.sheet.get_column_widths()
             elif hasattr(self.sheet, "column_widths"):
                 widths = list(self.sheet.column_widths)
-            else:
-                return
         except Exception:
             return
-
-        try:
-            try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    s = json.load(f)
-            except Exception:
-                s = {}
-            s["column_widths"] = widths
-            tmp = os.path.join(os.path.dirname(SETTINGS_FILE) or ".", "~settings.tmp.json")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(s, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, SETTINGS_FILE)
-        except Exception as e:
-            print("persist widths error:", e)
+        if self.active_template and widths is not None:
+            self._reload_templates_cache()
+            for t in self._templates_cache.get("templates", []):
+                if t.get("id") == self.active_template.get("id"):
+                    t["column_widths"] = widths
+                    break
+            _write_templates_file(self._templates_cache)
 
     def reset_column_widths(self):
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                s = json.load(f)
-        except Exception:
-            s = {}
-        if "column_widths" in s:
-            s.pop("column_widths", None)
-            try:
-                tmp = os.path.join(os.path.dirname(SETTINGS_FILE) or ".", "~settings.tmp.json")
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(s, f, ensure_ascii=False, indent=2)
-                os.replace(tmp, SETTINGS_FILE)
-            except Exception as e:
-                print("reset widths persist error:", e)
+        # reset for active template only
+        if not self.active_template:
+            return
+        self._reload_templates_cache()
+        for t in self._templates_cache.get("templates", []):
+            if t.get("id") == self.active_template.get("id"):
+                t["column_widths"] = None
+                break
+        _write_templates_file(self._templates_cache)
 
         data = self._get_sheet_data_copy()
         try:
@@ -1646,11 +1745,7 @@ class SpeechSheetApp:
             "rc_insert_column","rc_delete_column","rc_insert_row","rc_delete_row"
         ))
         self.sheet.set_sheet_data(data)
-
-        try:
-            _try_style_tksheet(self.root, dark=True)
-        except Exception:
-            pass
+        self._try_style()
 
         if sel:
             r, c = sel[0]
@@ -1669,16 +1764,19 @@ class SpeechSheetApp:
         if not selected:
             return
         row, col = list(selected)[0]
-        header = self.headers[col]
+        header_label = self.headers[col]
+        col_uid = self._column_uid_for_index(col)
 
         incoming = (text or "").strip()
         if not incoming:
             return
 
-        # Compute processed value first (date normalization OR glossary/name cleaning)
-        processed = None
+        # Decide terms for this column (mapped lists)
+        terms = self._lists_terms_for_column_uid(col_uid)
 
-        if header == "Дата":
+        # Processed value (date normalization OR glossary correction + optional name cleanup)
+        processed = None
+        if header_label == "Дата":
             value = normalize_date(incoming)
             if value is None:
                 try: self.root.bell()
@@ -1687,17 +1785,18 @@ class SpeechSheetApp:
                 return
             processed = value
         else:
-            value = correct_text_for_column(incoming, header)
-            if header in NAME_COLUMNS:
+            # Build synthetic glossary key for caching
+            key = f"col:{col_uid or col}"
+            GLOSSARIES[key] = terms  # dynamic supply of terms per column
+            value = correct_text_for_column(incoming, key)
+            if header_label in NAME_COLUMNS:
                 value = clean_person_field(value)
             processed = value
 
-        # Safety
         processed = (processed or "").strip()
         if not processed:
             return
 
-        # NEW — Append mode: append to existing cell instead of replacing (for all inputs)
         if APPEND_MODE:
             try:
                 existing = self.sheet.get_cell_data(row, col) or ""
@@ -1705,18 +1804,19 @@ class SpeechSheetApp:
                 existing = ""
             existing = str(existing).strip()
             if existing:
-                # simple spacing — could be enhanced to punctuation-aware merges
                 new_value = (existing + " " + processed).strip()
             else:
                 new_value = processed
             self.sheet.set_cell_data(row, col, new_value)
         else:
-            # original replace behavior
             self.sheet.set_cell_data(row, col, processed)
 
-
     def open_glossary_editor(self):
-        win = GlossaryEditor(self.root, GLOSSARY_FILE, on_saved=lambda: load_glossaries())
+        win = GlossaryListsAndMappingDialog(
+            self.root,
+            active_template=self.active_template,
+            on_saved=lambda: (load_glossary_lists(), _clear_best_caches())
+        )
         try:
             enable_crisp_dark_mode(win, dark=True, delay_ms=0)
         except Exception:
@@ -1864,9 +1964,8 @@ class SpeechSheetApp:
             "speed_mode": SPEED_MODE,
             "vad_strictness": VAD_STRICTNESS,
             "glossary_strictness": GLOSSARY_STRICTNESS,
-            "append_mode": APPEND_MODE, 
+            "append_mode": APPEND_MODE,
         }
-
 
     def _refresh_preview_font(self):
         try:
@@ -1896,24 +1995,18 @@ class SpeechSheetApp:
         prev = self._current_settings()
         self._settings_applying = True
         try:
-            # Determine if model switch is requested
             requested_model_key = s.get("model_key", prev["model_key"])
             model_changed = (requested_model_key != prev["model_key"])
 
-            # Save globals
             _apply_settings_to_globals(s)
             _save_settings_file(self._current_settings())
 
-            # UI scale changes
             if float(prev.get("ui_scale", 1.0)) != float(s.get("ui_scale", prev.get("ui_scale", 1.0))):
                 _apply_dark_ui(self.root, dark=True)
                 self._refresh_preview_font()
                 self._maybe_update_sheet_zoom()
                 self._style_action_buttons()
 
-            # Speed mode might change preview tail; no reload needed
-
-            # If listening and model changed, stop recording before reload
             if model_changed:
                 if self.is_listening:
                     self.stop_listening()
@@ -1931,7 +2024,6 @@ class SpeechSheetApp:
         finally:
             self._settings_applying = False
 
-    # Settings dialog
     def open_settings(self):
         SettingsDialog(
             self.root,
@@ -1947,7 +2039,6 @@ class SpeechSheetApp:
         LAST_ACTIVITY_TS = time.monotonic()
         self._listening_started_ts = LAST_ACTIVITY_TS
 
-        # reset rolling structures
         self._tail_chunks.clear()
         self._tail_total_samples = 0
         self._commit_chunks.clear()
@@ -1981,13 +2072,11 @@ class SpeechSheetApp:
         return int(_preview_tail_sec() * SAMPLERATE)
 
     def _push_tail(self, mono_1d: np.ndarray):
-        """Append to rolling tail (deque of 1D float32 chunks) and enforce length."""
         if mono_1d.size == 0:
             return
         self._tail_chunks.append(mono_1d)
         self._tail_total_samples += mono_1d.shape[0]
         limit = self._tail_limit_samples()
-        # trim from the left if we exceed the limit
         while self._tail_total_samples > limit and self._tail_chunks:
             excess = self._tail_total_samples - limit
             left = self._tail_chunks[0]
@@ -1995,7 +2084,6 @@ class SpeechSheetApp:
                 self._tail_total_samples -= left.shape[0]
                 self._tail_chunks.popleft()
             else:
-                # split the left chunk, drop only the needed prefix
                 remain = left[excess:].copy()
                 self._tail_chunks[0] = remain
                 self._tail_total_samples -= excess
@@ -2016,16 +2104,12 @@ class SpeechSheetApp:
                 time.sleep(0.03)
                 continue
 
-            # Drain queue quickly
             got_any = False
             while not audio_queue.empty():
                 blk = audio_queue.get()
                 got_any = True
-                # Add to commit accumulator (keep original 2D)
                 self._commit_chunks.append(blk)
                 self._commit_total_samples += len(blk)
-
-                # Add to tail as 1D (mono)
                 mono = blk[:, 0] if getattr(blk, "ndim", 0) > 1 else blk
                 mono = np.asarray(mono, dtype=np.float32, order="C")
                 self._push_tail(mono)
@@ -2033,12 +2117,10 @@ class SpeechSheetApp:
             if got_any:
                 last_audio_time = time.monotonic()
 
-            # Preview gating: only if enough tail and time since last preview
             now = time.monotonic()
-            tail_needed = int(_preview_tail_sec() * SAMPLERATE * 0.6)  # need at least ~60% of window
+            tail_needed = int(_preview_tail_sec() * SAMPLERATE * 0.6)
             if self._tail_total_samples >= tail_needed and (now - self._last_preview_decode_ts) >= PREVIEW_MIN_INTERVAL_SEC:
                 tail = self._concat_tail()
-                # quick silence gate
                 if rms_db(tail.flatten()) < (_energy_gate_db() + 2.0):
                     preview_text = ""
                 else:
@@ -2053,18 +2135,15 @@ class SpeechSheetApp:
                             self.root.after(0, lambda t=preview_text: self.preview_label.config(text="Preview: " + t))
                 self._last_preview_decode_ts = now
 
-            # Commit conditions
             timeout = self._commit_total_samples >= int(BLOCK_DURATION * SAMPLERATE)
 
-            # Tail silence? (use the last ~1.0 s of the tail; fall back to whatever length we have)
             if self._tail_total_samples > 0:
                 tail = self._concat_tail()
-                # CHANGED — use the new knobs
-                tail_len_samples = int(COMMIT_TAIL_SILENCE_SEC * SAMPLERATE)  # NEW (was int(0.6 * SAMPLERATE))
+                tail_len_samples = int(COMMIT_TAIL_SILENCE_SEC * SAMPLERATE)
                 tail_sil = tail[-tail_len_samples:] if tail.shape[0] >= tail_len_samples else tail
                 tail_is_silence = (
                     tail_sil is not None
-                    and tail_sil.shape[0] >= int(COMMIT_MIN_SILENCE_SEC * SAMPLERATE)  # NEW (was 0.5s)
+                    and tail_sil.shape[0] >= int(COMMIT_MIN_SILENCE_SEC * SAMPLERATE)
                     and is_silence(tail_sil, threshold_db=_energy_gate_db())
                 )
             else:
@@ -2072,16 +2151,13 @@ class SpeechSheetApp:
                 tail_sil = None
                 tail_is_silence = False
 
-            # Safety net: stop after 60s of inactivity
             if (time.monotonic() - last_audio_time) > 60.0:
                 self.root.after(0, lambda: self.preview_label.config(text="Preview: (auto-stopped after inactivity)"))
                 self.stop_listening()
                 return
 
             if tail_is_silence or timeout:
-                # Concatenate commit window only now
                 if not self._commit_chunks:
-                    # nothing to commit; just clear tail
                     self._tail_chunks.clear()
                     self._tail_total_samples = 0
                     time.sleep(0.03)
@@ -2092,7 +2168,6 @@ class SpeechSheetApp:
                 full_text = strip_trailing_dot(full_text)
 
                 if not full_text:
-                    # fallback to tail-only decode if recent preview was good
                     recent_preview = (time.monotonic() - getattr(self, "_last_preview_ts", 0.0)) < 3.0
                     if recent_preview and getattr(self, "_last_preview_text", "") and tail is not None:
                         try:
@@ -2105,13 +2180,11 @@ class SpeechSheetApp:
 
                 if full_text and not looks_like_outro(full_text):
                     self.root.after(0, self.add_text_to_cell, full_text)
-                    # update preview label only if changed
                     if full_text != self._last_preview_text:
                         self._last_preview_text = full_text
                         self._last_preview_ts = time.monotonic()
                         self.root.after(0, lambda t=full_text: self.preview_label.config(text="Preview: " + t))
 
-                # schedule preview clear
                 try:
                     if getattr(self, "_preview_clear_after", None):
                         self.root.after_cancel(self._preview_clear_after)
@@ -2123,14 +2196,12 @@ class SpeechSheetApp:
                     finally: setattr(self, "_preview_clear_after", None)
                 self._preview_clear_after = self.root.after(PREVIEW_CLEAR_DELAY_MS, _clear_preview)
 
-                # reset commit + tail efficiently
                 self._commit_chunks.clear()
                 self._commit_total_samples = 0
                 self._tail_chunks.clear()
                 self._tail_total_samples = 0
 
-            time.sleep(0.02)  # tight loop for low latency, still cooperative
-
+            time.sleep(0.02)
 
     def reset_audio_state(self):
         global audio_queue
@@ -2149,7 +2220,7 @@ class SpeechSheetApp:
         except Exception:
             pass
 
-    # Silence-guard timer (ensure we keep counting even if not listening)
+    # Silence-guard timer
     def _start_silence_guard(self):
         def tick():
             if self.is_listening:
@@ -2161,7 +2232,6 @@ class SpeechSheetApp:
             self._silence_guard_job = self.root.after(1000, tick)
         self._silence_guard_job = self.root.after(1000, tick)
 
-    # Console detach (Windows)
     def _detach_console_if_any(self):
         if sys.platform.startswith("win"):
             try:
@@ -2172,7 +2242,6 @@ class SpeechSheetApp:
             except Exception:
                 pass
 
-    # Styling
     def _style_action_buttons(self):
         START_BG  = "#2e7d32"
         START_BG_H= "#2b7030"
@@ -2229,14 +2298,34 @@ class SpeechSheetApp:
                 messagebox.showerror("Export failed", f"Could not export:\n{e2}")
 
     def save_data(self):
+        if not self.active_template:
+            # legacy fallback
+            data = self.sheet.get_sheet_data()
+            df = pd.DataFrame(data, columns=self.headers)
+            df.to_csv(DATA_FILE, index=False, encoding="utf-8-sig", na_rep="")
+            return
+        path = _data_path_for_template(self.active_template["id"])
         data = self.sheet.get_sheet_data()
         df = pd.DataFrame(data, columns=self.headers)
-        df.to_csv(DATA_FILE, index=False, encoding="utf-8-sig", na_rep="")
+        df.to_csv(path, index=False, encoding="utf-8-sig", na_rep="")
 
     def load_data(self):
-        if os.path.exists(DATA_FILE):
-            df = pd.read_csv(DATA_FILE, encoding="utf-8-sig", keep_default_na=False)
+        if not self.active_template:
+            if os.path.exists(DATA_FILE):
+                df = pd.read_csv(DATA_FILE, encoding="utf-8-sig", keep_default_na=False)
+                df = df.fillna("")
+                if list(df.columns) != self.headers and len(df.columns) == len(self.headers):
+                    df.columns = self.headers
+                self.sheet.set_sheet_data(df.values.tolist())
+            else:
+                self.add_rows(20)
+            return
+
+        path = _data_path_for_template(self.active_template["id"])
+        if os.path.exists(path):
+            df = pd.read_csv(path, encoding="utf-8-sig", keep_default_na=False)
             df = df.fillna("")
+            # align headers
             if list(df.columns) != self.headers and len(df.columns) == len(self.headers):
                 df.columns = self.headers
             self.sheet.set_sheet_data(df.values.tolist())
@@ -2244,24 +2333,22 @@ class SpeechSheetApp:
             self.add_rows(20)
 
     def save_column_widths(self):
-        self._persist_column_widths_to_settings()
+        self._persist_column_widths_to_template()
 
     def load_column_widths(self):
+        # apply template-specific widths
         try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                settings = json.load(f)
-        except FileNotFoundError:
-            return
+            self._reload_templates_cache()
+            if not self.active_template:
+                return
+            for t in self._templates_cache.get("templates", []):
+                if t.get("id") == self.active_template.get("id"):
+                    widths = t.get("column_widths")
+                    if widths:
+                        self.apply_column_widths(widths)
+                    break
         except Exception as e:
-            print("load_column_widths error (read):", e)
-            return
-        widths = settings.get("column_widths")
-        if widths is None:
-            return
-        try:
-            self.apply_column_widths(widths)
-        except Exception as e:
-            print("load_column_widths error (apply):", e)
+            print("load_column_widths error:", e)
 
     def on_close(self):
         try:
@@ -2306,28 +2393,34 @@ class SpeechSheetApp:
         except Exception:
             pass
 
+    def _try_style(self):
+        try:
+            _try_style_tksheet(self.root, dark=True)
+        except Exception:
+            pass
+
+    # Template Manager dialog
+    def open_template_manager(self):
+        TemplateManagerDialog(
+            self.root,
+            on_open=self._set_active_template
+        )
+
+
 # ===========================
-# Glossary Editor (unchanged features)
+# Glossary Lists + Mapping Dialog
 # ===========================
-class GlossaryEditor(tk.Toplevel):
-    def __init__(self, master, path: str, on_saved=None):
+class GlossaryListsAndMappingDialog(tk.Toplevel):
+    def __init__(self, master, active_template: dict, on_saved=None):
         super().__init__(master)
-        self.title("Glossary Editor")
-        self.geometry("820x500")
-        self.minsize(820, 520)
+        self.title("Glossary Lists & Mapping")
+        self.geometry("980x580")
+        self.minsize(900, 540)
         self.transient(master)
-        self.path = path
+        self.active_template = active_template
         self.on_saved = on_saved or (lambda: None)
 
-        try:
-            c = _gfm_palette(True)
-        except Exception:
-            c = {
-                "bg":"#0f1216","surface":"#151a21","elevated":"#1b212a","text":"#e6e6e6","muted":"#a8b2bd",
-                "accent":"#479d7b","border":"#2b323c","sel_bg":"#263a33","sel_fg":"#eaf5f0",
-                "button_bg":"#222833","button_active_bg":"#2a3140","button_fg":"#eef1f4","button_border":"#333a46",
-            }
-
+        c = _gfm_palette(True)
         self.configure(bg=c["bg"])
 
         topbar = tk.Frame(self, bg=c["surface"])
@@ -2342,104 +2435,300 @@ class GlossaryEditor(tk.Toplevel):
             except Exception:
                 pass
 
-        btn_save = tk.Button(topbar, text="💾 Save", command=self._save)
-        btn_reload = tk.Button(topbar, text="↺ Reload", command=self._reload)
+        btn_save = tk.Button(topbar, text="💾 Save", command=self._save_all)
         btn_close = tk.Button(topbar, text="Save & Close", command=self._on_close)
-        for w in (btn_save, btn_reload):
+        for w in (btn_save,):
             _style_btn(w); w.pack(side="left", padx=4, pady=6)
         _style_btn(btn_close); btn_close.pack(side="right", padx=4, pady=6)
 
-        content = tk.Frame(self, bg=c["bg"])
-        content.pack(side="top", fill="both", expand=True, padx=10, pady=(0, 10))
+        # Content layout: three columns
+        wrap = tk.Frame(self, bg=c["bg"])
+        wrap.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        left = tk.Frame(content, bg=c["bg"], width=260)
-        left.pack(side="left", fill="y", expand=False, padx=(0, 10))
-        left.pack_propagate(True)
+        # Left: Lists
+        left = tk.Frame(wrap, bg=c["bg"], width=280); left.pack(side="left", fill="y", padx=(0,10))
+        tk.Label(left, text="Lists", bg=c["bg"], fg=c["text"]).pack(anchor="w")
+        self.lb_lists = tk.Listbox(left, exportselection=False, bg=c["surface"], fg=c["text"],
+                                   selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
+                                   highlightthickness=1, highlightbackground=c["border"], relief="flat")
+        self.lb_lists.pack(fill="both", expand=True)
+        btns_l = tk.Frame(left, bg=c["bg"]); btns_l.pack(fill="x", pady=(6,0))
+        b_add_l = tk.Button(btns_l, text="➕ Add list", command=self._add_list)
+        b_ren_l = tk.Button(btns_l, text="✏ Rename", command=self._rename_list)
+        b_del_l = tk.Button(btns_l, text="🗑 Delete", command=self._delete_list)
+        for b in (b_add_l, b_ren_l, b_del_l):
+            _style_btn(b); b.pack(side="left", padx=3)
 
-        right = tk.Frame(content, bg=c["bg"])
-        right.pack(side="left", fill="both", expand=True)
+        # Middle: Terms for selected list
+        mid = tk.Frame(wrap, bg=c["bg"], width=360); mid.pack(side="left", fill="both", expand=True, padx=(0,10))
+        tk.Label(mid, text="Terms of selected list", bg=c["bg"], fg=c["text"]).pack(anchor="w")
+        self.lb_terms = tk.Listbox(mid, exportselection=False, bg=c["surface"], fg=c["text"],
+                                   selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
+                                   highlightthickness=1, highlightbackground=c["border"], relief="flat")
+        self.lb_terms.pack(fill="both", expand=True)
+        bot_term = tk.Frame(mid, bg=c["bg"]); bot_term.pack(fill="x", pady=(6,0))
+        self.term_entry = tk.Entry(bot_term, relief="flat", bg=c["surface"], fg=c["text"])
+        self.term_entry.pack(side="left", fill="x", expand=True, padx=(0,6))
+        b_add_t = tk.Button(bot_term, text="Add term", command=self._add_term)
+        b_del_t = tk.Button(bot_term, text="Remove term", command=self._remove_term)
+        for b in (b_add_t, b_del_t):
+            _style_btn(b); b.pack(side="left", padx=3)
 
-        self.data: dict[str, list[str]] = {}
-        self._load_from_file()
+        # Right: Mapping (columns <-> lists)
+        right = tk.Frame(wrap, bg=c["bg"], width=320); right.pack(side="left", fill="y")
+        tk.Label(right, text="Columns (current template)", bg=c["bg"], fg=c["text"]).pack(anchor="w")
+        self.lb_cols = tk.Listbox(right, exportselection=False, bg=c["surface"], fg=c["text"],
+                                  selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
+                                  highlightthickness=1, highlightbackground=c["border"], relief="flat", height=10)
+        self.lb_cols.pack(fill="x")
+        map_btns = tk.Frame(right, bg=c["bg"]); map_btns.pack(fill="x", pady=(6,0))
+        b_assign = tk.Button(map_btns, text="⮕ Assign selected list(s)", command=self._assign_lists_to_col)
+        b_clear  = tk.Button(map_btns, text="⨯ Clear mapping for column", command=self._clear_mapping_for_col)
+        for b in (b_assign, b_clear):
+            _style_btn(b); b.pack(side="left", padx=3)
 
-        tk.Label(left, text="Columns", bg=c["bg"], fg=c["text"]).pack(anchor="w")
-        self.headers_lb = tk.Listbox(
-            left, exportselection=False, bg=c["surface"], fg=c["text"],
-            selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
-            highlightthickness=1, highlightbackground=c["border"], relief="flat"
-        )
-        self.headers_lb.pack(fill="both", expand=True)
+        tk.Label(right, text="Lists mapped to selected column", bg=c["bg"], fg=c["text"]).pack(anchor="w", pady=(10,0))
+        self.lb_mapped = tk.Listbox(right, exportselection=False, bg=c["surface"], fg=c["text"],
+                                    selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
+                                    highlightthickness=1, highlightbackground=c["border"], relief="flat", height=8)
+        self.lb_mapped.pack(fill="both", expand=True)
 
-        btns_h = tk.Frame(left, bg=c["bg"]); btns_h.pack(fill="x", pady=(6, 0))
-        for txt, cmd in (("➕ Add", self._add_header),
-                         ("✏ Rename", self._rename_header),
-                         ("🗑 Delete", self._delete_header)):
-            b = tk.Button(btns_h, text=txt, command=cmd)
-            _style_btn(b); b.pack(side="left", padx=2)
+        # Data
+        self._refresh_lists()
+        self._refresh_columns()
+        self.lb_lists.bind("<<ListboxSelect>>", lambda e: self._refresh_terms())
+        self.lb_cols.bind("<<ListboxSelect>>", lambda e: self._refresh_mapped_for_col())
 
-        tk.Label(right, text="Terms for selected column", bg=c["bg"], fg=c["text"]).pack(anchor="w")
-
-        terms_wrap = tk.Frame(right, bg=c["bg"])
-        terms_wrap.pack(fill="both", expand=True)
-
-        self.terms_lb = tk.Listbox(
-            terms_wrap, exportselection=False, bg=c["surface"], fg=c["text"],
-            selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
-            highlightthickness=1, highlightbackground=c["border"], relief="flat"
-        )
-        self.terms_lb.pack(side="left", fill="both", expand=True)
-
-        tscroll_y = tk.Scrollbar(terms_wrap, orient="vertical")
-        tscroll_y.pack(side="right", fill="y")
-        self.terms_lb.configure(yscrollcommand=tscroll_y.set)
-        tscroll_y.configure(command=self.terms_lb.yview)
         try:
-            tscroll_y.configure(
-                bg=c["surface"],
-                activebackground=c["button_active_bg"],
-                troughcolor=c["border"],
-                highlightthickness=0,
-                bd=0,
-                relief="flat",
-                width=12
-            )
+            enable_crisp_dark_mode(self, dark=True, delay_ms=0)
         except Exception:
             pass
 
-        term_box = tk.Frame(right, bg=c["bg"])
-        term_box.pack(fill="x", pady=(10, 0))
+    # ---- Lists / Terms ----
+    def _lists_dict(self) -> dict:
+        return GLOSSARY_LISTS.get("lists", {})
 
-        tk.Label(term_box, text="New term", bg=c["bg"], fg=c["muted"]).pack(anchor="w")
+    def _refresh_lists(self):
+        self.lb_lists.delete(0, "end")
+        lists = self._lists_dict()
+        by_name = sorted([(lid, lists[lid]["name"]) for lid in lists], key=lambda x: x[1].lower())
+        self._lists_sorted = by_name
+        for _, name in by_name:
+            self.lb_lists.insert("end", name)
+        if self.lb_lists.size() > 0:
+            self.lb_lists.selection_set(0)
+            self.lb_lists.activate(0)
+        self._refresh_terms()
 
-        self._term_card = tk.Frame(term_box, bg=c.get("elevated", "#1b212a"),
-                                   highlightthickness=1, highlightbackground=c["accent"], relief="flat", bd=0)
-        self._term_card.pack(fill="x", expand=False, pady=(4, 8))
+    def _sel_list_id(self) -> Optional[str]:
+        sel = self.lb_lists.curselection()
+        if not sel:
+            return None
+        idx = sel[0]
+        if idx < 0 or idx >= len(getattr(self, "_lists_sorted", [])):
+            return None
+        return self._lists_sorted[idx][0]
 
-        self.term_entry = tk.Entry(self._term_card, font=("Segoe UI", 12), relief="flat", bd=0)
-        self.term_entry.pack(fill="x", expand=True, padx=10, pady=10)
+    def _refresh_terms(self):
+        self.lb_terms.delete(0, "end")
+        lid = self._sel_list_id()
+        if not lid:
+            return
+        terms = self._lists_dict().get(lid, {}).get("terms", [])
+        for t in terms:
+            self.lb_terms.insert("end", t)
 
-        self._restyle_term_entry(c)
+    def _add_list(self):
+        name = simpledialog.askstring("New list", "List name:")
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        lists = self._lists_dict()
+        # ensure unique name
+        if any(lists[x]["name"].strip().lower() == name.lower() for x in lists):
+            messagebox.showinfo("Info", "A list with that name already exists.")
+            return
+        lid = _new_uuid()
+        lists[lid] = {"name": name, "terms": []}
+        save_glossary_lists()
+        self._refresh_lists()
 
-        def _on_focus_in(_):
-            try:
-                self._term_card.configure(highlightbackground=c["accent"], highlightcolor=c["accent"])
-            except Exception:
-                pass
+    def _rename_list(self):
+        lid = self._sel_list_id()
+        if not lid:
+            return
+        cur = self._lists_dict()[lid]["name"]
+        new = simpledialog.askstring("Rename list", "New name:", initialvalue=cur)
+        if not new:
+            return
+        new = new.strip()
+        if not new or new == cur:
+            return
+        if any(self._lists_dict()[x]["name"].strip().lower() == new.lower() for x in self._lists_dict()):
+            messagebox.showinfo("Info", "A list with that name already exists.")
+            return
+        self._lists_dict()[lid]["name"] = new
+        save_glossary_lists()
+        self._refresh_lists()
 
-        def _on_focus_out(_):
-            try:
-                self._term_card.configure(highlightbackground=c["border"], highlightcolor=c["border"])
-            except Exception:
-                pass
+    def _delete_list(self):
+        lid = self._sel_list_id()
+        if not lid:
+            return
+        if not messagebox.askyesno("Confirm", "Delete this list and remove it from all mappings?"):
+            return
+        # remove from lists
+        self._lists_dict().pop(lid, None)
+        # remove from mappings in templates
+        data = _ensure_templates_file([])
+        changed = False
+        for t in data.get("templates", []):
+            mp = t.get("mapping", {})
+            for k in list(mp.keys()):
+                if lid in mp[k]:
+                    mp[k] = [x for x in mp[k] if x != lid]
+                    changed = True
+        if changed:
+            _write_templates_file(data)
+        save_glossary_lists()
+        self._refresh_lists()
+        self._refresh_mapped_for_col()
 
-        self.term_entry.bind("<FocusIn>", _on_focus_in)
-        self.term_entry.bind("<FocusOut>", _on_focus_out)
-        self.term_entry.bind("<Return>", lambda e: self._add_term())
+    def _add_term(self):
+        lid = self._sel_list_id()
+        if not lid:
+            messagebox.showinfo("Info", "Select a list first.")
+            return
+        term = self.term_entry.get().strip()
+        if not term:
+            return
+        arr = self._lists_dict().setdefault(lid, {}).setdefault("terms", [])
+        if any(t.strip().lower() == term.lower() for t in arr):
+            messagebox.showinfo("Info", "This term already exists in the list.")
+            return
+        arr.append(term)
+        self.term_entry.delete(0, "end")
+        save_glossary_lists()
+        self._refresh_terms()
 
-        term_btns = tk.Frame(term_box, bg=c["bg"]); term_btns.pack(fill="x")
-        b_add = tk.Button(term_btns, text="➕ Add term", command=self._add_term)
-        b_del = tk.Button(term_btns, text="🗑 Remove term", command=self._remove_term)
-        def _style_btn2(b):
+    def _remove_term(self):
+        lid = self._sel_list_id()
+        if not lid:
+            return
+        sel = self.lb_terms.curselection()
+        if not sel:
+            return
+        term = self.lb_terms.get(sel[0])
+        arr = self._lists_dict().get(lid, {}).get("terms", [])
+        self._lists_dict()[lid]["terms"] = [t for t in arr if t != term]
+        save_glossary_lists()
+        self._refresh_terms()
+
+    # ---- Columns & Mapping ----
+    def _refresh_columns(self):
+        self.lb_cols.delete(0, "end")
+        if not self.active_template:
+            return
+        self._cols_sorted = [(col["uid"], col["header"]) for col in self.active_template.get("columns", [])]
+        for _, hdr in self._cols_sorted:
+            self.lb_cols.insert("end", hdr)
+        if self.lb_cols.size() > 0:
+            self.lb_cols.selection_set(0)
+            self.lb_cols.activate(0)
+        self._refresh_mapped_for_col()
+
+    def _sel_col_uid(self) -> Optional[str]:
+        sel = self.lb_cols.curselection()
+        if not sel:
+            return None
+        idx = sel[0]
+        if idx < 0 or idx >= len(getattr(self, "_cols_sorted", [])):
+            return None
+        return self._cols_sorted[idx][0]
+
+    def _refresh_mapped_for_col(self):
+        self.lb_mapped.delete(0, "end")
+        col_uid = self._sel_col_uid()
+        if not col_uid or not self.active_template:
+            return
+        mp = self.active_template.get("mapping", {})
+        list_ids = mp.get(col_uid, [])
+        lists = self._lists_dict()
+        names = [lists.get(lid, {}).get("name", f"(missing {lid[:6]})") for lid in list_ids]
+        for n in names:
+            self.lb_mapped.insert("end", n)
+
+    def _assign_lists_to_col(self):
+        col_uid = self._sel_col_uid()
+        if not col_uid:
+            messagebox.showinfo("Info", "Select a column first.")
+            return
+        sels = self.lb_lists.curselection()
+        if not sels:
+            messagebox.showinfo("Info", "Select one or more lists to assign.")
+            return
+        chosen_ids = [self._lists_sorted[i][0] for i in sels]
+        data = _ensure_templates_file([])
+        for t in data.get("templates", []):
+            if t.get("id") == self.active_template.get("id"):
+                mp = t.setdefault("mapping", {})
+                cur = list(dict.fromkeys(mp.get(col_uid, []) + chosen_ids))
+                mp[col_uid] = cur
+                break
+        _write_templates_file(data)
+        # refresh local copy
+        self.active_template = _active_template_record()
+        self._refresh_mapped_for_col()
+
+    def _clear_mapping_for_col(self):
+        col_uid = self._sel_col_uid()
+        if not col_uid:
+            return
+        data = _ensure_templates_file([])
+        for t in data.get("templates", []):
+            if t.get("id") == self.active_template.get("id"):
+                mp = t.setdefault("mapping", {})
+                if col_uid in mp:
+                    mp[col_uid] = []
+                break
+        _write_templates_file(data)
+        self.active_template = _active_template_record()
+        self._refresh_mapped_for_col()
+
+    def _save_all(self):
+        # Glossary lists already saved on each edit; here we only bump version (done via save_glossary_lists())
+        try:
+            self.on_saved()
+            messagebox.showinfo("Saved", "Glossary lists and mapping saved.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save:\n{e}")
+
+    def _on_close(self):
+        try:
+            self.on_saved()
+        finally:
+            self.destroy()
+
+# ===========================
+# Template Manager Dialog
+# ===========================
+class TemplateManagerDialog(tk.Toplevel):
+    def __init__(self, master, on_open: Callable[[str], None]):
+        super().__init__(master)
+        self.title("Templates")
+        self.geometry("820x520")
+        self.minsize(780, 480)
+        self.transient(master)
+        self.on_open = on_open
+
+        c = _gfm_palette(True)
+        self.configure(bg=c["bg"])
+
+        top = tk.Frame(self, bg=c["surface"]); top.pack(side="top", fill="x", padx=10, pady=(10, 6))
+
+        def _style_btn(b):
             try:
                 b.configure(bg=c["button_bg"], fg=c["button_fg"],
                             activebackground=c["button_active_bg"], activeforeground=c["button_fg"],
@@ -2447,226 +2736,193 @@ class GlossaryEditor(tk.Toplevel):
                             highlightbackground=c["button_border"], highlightcolor=c["button_border"])
             except Exception:
                 pass
-        _style_btn2(b_add); _style_btn2(b_del)
-        b_add.pack(side="left"); b_del.pack(side="left", padx=(6, 0))
 
-        self.headers_lb.bind("<<ListboxSelect>>", lambda e: self._refresh_terms())
-        self._refresh_headers()
-        if self.headers_lb.size() > 0:
-            self.headers_lb.selection_set(0)
-            self.headers_lb.activate(0)
-            self._refresh_terms()
-            try: self.term_entry.focus_set()
-            except Exception: pass
+        self.btn_open = tk.Button(top, text="Open", command=self._open_selected)
+        self.btn_new  = tk.Button(top, text="New (from current headers)", command=self._new_from_current)
+        self.btn_dup  = tk.Button(top, text="Duplicate", command=self._duplicate)
+        self.btn_ren  = tk.Button(top, text="Rename", command=self._rename)
+        self.btn_del  = tk.Button(top, text="Delete", command=self._delete)
+        self.btn_imp  = tk.Button(top, text="Import CSV/Excel", command=self._import_template)
+
+        for b in (self.btn_open, self.btn_new, self.btn_dup, self.btn_ren, self.btn_del, self.btn_imp):
+            _style_btn(b); b.pack(side="left", padx=4, pady=6)
+
+        wrap = tk.Frame(self, bg=c["bg"]); wrap.pack(fill="both", expand=True, padx=10, pady=(0,10))
+        self.lb = tk.Listbox(wrap, exportselection=False, bg=c["surface"], fg=c["text"],
+                             selectbackground=c["sel_bg"], selectforeground=c["sel_fg"],
+                             highlightthickness=1, highlightbackground=c["border"], relief="flat")
+        self.lb.pack(fill="both", expand=True)
+
+        self._reload()
+        self.lb.bind("<Double-Button-1>", lambda e: self._open_selected())
 
         try:
             enable_crisp_dark_mode(self, dark=True, delay_ms=0)
         except Exception:
             pass
-        try:
-            self.after(30, lambda: self._restyle_term_entry(c))
-        except Exception:
-            pass
-
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _load_from_file(self):
-        try:
-            if os.path.exists(self.path):
-                with open(self.path, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-                norm: dict[str, list[str]] = {}
-                if isinstance(raw, dict):
-                    for k, v in raw.items():
-                        if isinstance(v, list):
-                            norm[str(k)] = [str(x) for x in v]
-                        elif isinstance(v, dict):
-                            norm[str(k)] = [str(x) for x in v.keys()]
-                self.data = norm
-            else:
-                self.data = {}
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load glossary:\n{e}")
-            self.data = {}
-
-    def _write_to_file(self):
-        tmp = os.path.join(os.path.dirname(self.path) or ".", "~glossary.tmp.json")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.path)
-
-    def _restyle_term_entry(self, c: dict):
-        card_bg = c.get("elevated", "#1b212a")
-        field_fg = c.get("text", "#e6e6e6")
-        try:
-            self._term_card.configure(bg=card_bg, highlightbackground=c.get("border", "#2b323c"))
-            self.term_entry.configure(
-                bg=card_bg,
-                fg=field_fg,
-                insertbackground=field_fg,
-                relief="flat",
-                bd=0
-            )
-        except Exception:
-            pass
-
-    def _autosize_lists(self):
-        try:
-            from tkinter import font as _tkfont
-            f = _tkfont.nametofont("TkTextFont")
-        except Exception:
-            f = None
-        def fit(lb: tk.Listbox):
-            items = lb.get(0, "end")
-            if not items:
-                lb.configure(width=24); return
-            if f:
-                px = max(f.measure(str(s)) for s in items) + 24
-                w0 = max(16, f.measure("0"))
-                ch = max(24, int(px / max(1, w0)))
-                lb.configure(width=ch)
-            else:
-                ch = max(24, max(len(str(s)) for s in items))
-                lb.configure(width=ch)
-        fit(self.headers_lb)
-        fit(self.terms_lb)
-
-    def _refresh_headers(self):
-        self.headers_lb.delete(0, "end")
-        for k in sorted(self.data.keys(), key=str.lower):
-            self.headers_lb.insert("end", k)
-        self._autosize_lists()
-
-    def _current_header(self) -> Optional[str]:
-        sel = self.headers_lb.curselection()
-        if not sel:
-            return None
-        return self.headers_lb.get(sel[0])
-
-    def _ensure_header_selected(self) -> Optional[str]:
-        hdr = self._current_header()
-        if hdr:
-            return hdr
-        if self.headers_lb.size() == 1:
-            self.headers_lb.selection_set(0)
-            self.headers_lb.activate(0)
-            hdr = self.headers_lb.get(0)
-        return hdr
-
-    def _refresh_terms(self):
-        hdr = self._current_header()
-        self.terms_lb.delete(0, "end")
-        if hdr is None:
-            self._autosize_lists()
-            return
-        for t in sorted(self.data.get(hdr, []), key=str.lower):
-            self.terms_lb.insert("end", t)
-        self._autosize_lists()
-
-    def _add_header(self):
-        name = simpledialog.askstring("New column", "Column header:")
-        if not name: return
-        name = name.strip()
-        if not name: return
-        if name in self.data:
-            messagebox.showinfo("Info", "This column already exists.")
-            return
-        self.data[name] = []
-        self._refresh_headers()
-        headers_sorted = sorted(self.data.keys(), key=str.lower)
-        idx = headers_sorted.index(name)
-        self.headers_lb.selection_clear(0, "end")
-        self.headers_lb.selection_set(idx); self.headers_lb.activate(idx)
-        self._refresh_terms()
-        try: self.term_entry.focus_set()
-        except Exception: pass
-
-    def _rename_header(self):
-        hdr = self._current_header()
-        if not hdr: return
-        new = simpledialog.askstring("Rename column", "New name:", initialvalue=hdr)
-        if not new: return
-        new = new.strip()
-        if not new or new == hdr: return
-        if new in self.data:
-            messagebox.showinfo("Info", "A column with that name already exists.")
-            return
-        self.data[new] = self.data.pop(hdr)
-        self._refresh_headers()
-        headers_sorted = sorted(self.data.keys(), key=str.lower)
-        idx = headers_sorted.index(new)
-        self.headers_lb.selection_clear(0, "end")
-        self.headers_lb.selection_set(idx); self.headers_lb.activate(idx)
-        self._refresh_terms()
-
-    def _delete_header(self):
-        hdr = self._current_header()
-        if not hdr: return
-        if not messagebox.askyesno("Confirm", f"Delete column '{hdr}' and all its terms?"):
-            return
-        self.data.pop(hdr, None)
-        self._refresh_headers()
-        self._refresh_terms()
-
-    def _add_term(self):
-        hdr = self._ensure_header_selected()
-        if not hdr:
-            messagebox.showinfo("Info", "Add or select a column first.")
-            return
-        term = self.term_entry.get().strip()
-        if not term:
-            return
-        arr = self.data.setdefault(hdr, [])
-        if term.lower() in (t.lower() for t in arr):
-            messagebox.showinfo("Info", "This term already exists in the column.")
-            return
-        arr.append(term)
-        self.term_entry.delete("end", "end")
-        self._refresh_terms()
-
-    def _remove_term(self):
-        hdr = self._current_header()
-        if not hdr: return
-        sel = self.terms_lb.curselection()
-        if not sel: return
-        term = self.terms_lb.get(sel[0])
-        arr = self.data.get(hdr, [])
-        self.data[hdr] = [t for t in arr if t != term]
-        self._refresh_terms()
-
-    def _save(self):
-        try:
-            self._write_to_file()
-            try:
-                self.on_saved()
-            except Exception:
-                pass
-            messagebox.showinfo("Saved", f"Glossary saved to:\n{self.path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save glossary:\n{e}")
 
     def _reload(self):
-        self._load_from_file()
-        self._refresh_headers()
-        self._refresh_terms()
+        self.lb.delete(0, "end")
+        self.data = _ensure_templates_file([])
+        tid = self.data.get("last_template_id")
+        self.rows = []
+        for t in self.data.get("templates", []):
+            nm = t.get("name", "(unnamed)")
+            ident = t.get("id", "")[:8]
+            mark = " (current)" if t.get("id") == tid else ""
+            self.rows.append(t["id"])
+            self.lb.insert("end", f"{nm} [{ident}]{mark}")
 
-    def _on_close(self):
+        if self.lb.size() > 0:
+            sel_idx = 0
+            # try to preselect current
+            for i, t in enumerate(self.data.get("templates", [])):
+                if t.get("id") == tid:
+                    sel_idx = i; break
+            self.lb.selection_set(sel_idx)
+            self.lb.activate(sel_idx)
+
+    def _sel_template_id(self) -> Optional[str]:
+        sel = self.lb.curselection()
+        if not sel:
+            return None
+        idx = sel[0]
+        if idx < 0 or idx >= len(self.rows):
+            return None
+        return self.rows[idx]
+
+    def _open_selected(self):
+        tid = self._sel_template_id()
+        if not tid:
+            return
         try:
-            self._write_to_file()
-            try:
-                self.on_saved()
-            except Exception:
-                pass
+            self.on_open(tid)
+            self._reload()
         except Exception as e:
+            messagebox.showerror("Open template", str(e))
+
+    def _new_from_current(self):
+        # Create a blank template with current headers from the *active template* (not reading sheet)
+        data = _ensure_templates_file([])
+        cur = data.get("last_template_id")
+        headers = []
+        for t in data.get("templates", []):
+            if t.get("id") == cur:
+                headers = [c["header"] for c in t.get("columns", [])]
+                break
+        if not headers:
+            headers = ["Колонка 1", "Колонка 2"]
+        t = _make_default_template(headers)
+        t["name"] = simpledialog.askstring("Template name", "New template name:", initialvalue="New Template") or "New Template"
+        data["templates"].append(t)
+        _write_templates_file(data)
+        self._reload()
+
+    def _duplicate(self):
+        data = _ensure_templates_file([])
+        tid = self._sel_template_id()
+        if not tid:
+            return
+        src = None
+        for t in data.get("templates", []):
+            if t.get("id") == tid:
+                src = t; break
+        if not src:
+            return
+        dup = {
+            "id": _new_uuid(),
+            "name": (src.get("name","") + " (copy)")[:64] or "Copy",
+            "columns": [{"uid": _new_uuid(), "header": c["header"]} for c in src.get("columns", [])],
+            "mapping": {},  # do not copy mapping by default (easy to switch if desired)
+            "column_widths": src.get("column_widths")
+        }
+        data["templates"].append(dup)
+        _write_templates_file(data)
+        # Optional: also duplicate data?
+        src_path = _data_path_for_template(src["id"])
+        dst_path = _data_path_for_template(dup["id"])
+        try:
+            if os.path.exists(src_path) and not os.path.exists(dst_path):
+                pd.read_csv(src_path, encoding="utf-8-sig", keep_default_na=False).to_csv(dst_path, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            print("dup data warn:", e)
+        self._reload()
+
+    def _rename(self):
+        data = _ensure_templates_file([])
+        tid = self._sel_template_id()
+        if not tid:
+            return
+        for t in data.get("templates", []):
+            if t.get("id") == tid:
+                cur = t.get("name","")
+                new = simpledialog.askstring("Rename template", "New name:", initialvalue=cur)
+                if not new:
+                    return
+                t["name"] = new.strip() or cur
+                break
+        _write_templates_file(data)
+        self._reload()
+
+    def _delete(self):
+        data = _ensure_templates_file([])
+        tid = self._sel_template_id()
+        if not tid:
+            return
+        if data.get("last_template_id") == tid:
+            messagebox.showwarning("Delete", "You cannot delete the currently open template. Open a different one first.")
+            return
+        if not messagebox.askyesno("Confirm", "Delete the selected template (structure only)?\nData file will remain on disk."):
+            return
+        data["templates"] = [t for t in data.get("templates", []) if t.get("id") != tid]
+        _write_templates_file(data)
+        self._reload()
+
+    def _import_template(self):
+        path = filedialog.askopenfilename(
+            title="Import CSV/Excel",
+            filetypes=[("CSV / Excel", "*.csv *.xlsx *.xls")]
+        )
+        if not path:
+            return
+        # Read with pandas
+        try:
+            if path.lower().endswith(".csv"):
+                df = pd.read_csv(path, header=0, encoding="utf-8-sig", keep_default_na=False)
+            else:
+                try:
+                    df = pd.read_excel(path, header=0)
+                except Exception as e:
+                    messagebox.showerror("Excel import", f"Excel import requires 'openpyxl'.\n\n{e}")
+                    return
+        except Exception as e:
+            messagebox.showerror("Import", f"Failed to import file:\n{e}")
+            return
+
+        # First row are headers -> already used by header=0
+        headers = [str(h) for h in df.columns]
+        t = _make_default_template(headers)
+        t["name"] = simpledialog.askstring("Template name", "Name for the imported template:", initialvalue=os.path.basename(path)) or os.path.basename(path)
+        # Reset mapping for new template (as requested)
+        t["mapping"] = {}
+        # Save template
+        data = _ensure_templates_file([])
+        data["templates"].append(t)
+        _write_templates_file(data)
+
+        # Ask to import data rows into template's dataset
+        if messagebox.askyesno("Import data", "Also import the file rows into this template's dataset?"):
             try:
-                messagebox.showerror("Error", f"Failed to save glossary on close:\n{e}")
-            except Exception:
-                pass
-        finally:
-            self.destroy()
+                df = df.fillna("")
+                out = _data_path_for_template(t["id"])
+                df.to_csv(out, index=False, encoding="utf-8-sig")
+            except Exception as e:
+                messagebox.showerror("Import data", f"Failed to save dataset:\n{e}")
+
+        self._reload()
 
 # ===========================
-# Settings dialog (adds model picker + speed mode)
+# Settings dialog (unchanged, except reset widths now per-template)
 # ===========================
 class SettingsDialog(tk.Toplevel):
     def __init__(self, master, initial: dict, on_apply: Callable[[dict], None], on_reset_widths: Optional[Callable[[], None]] = None):
@@ -2760,7 +3016,7 @@ class SettingsDialog(tk.Toplevel):
 
         frm.grid_columnconfigure(0, weight=1)
 
-        # NEW — Append mode
+        # Append mode
         self.var_append = tk.BooleanVar(value=bool(initial.get("append_mode", False)))
         append_box = tk.Checkbutton(
             frm,
@@ -2824,7 +3080,7 @@ class SettingsDialog(tk.Toplevel):
         def _reset_widths():
             if callable(self.on_reset_widths):
                 self.on_reset_widths()
-                messagebox.showinfo("Column widths", "Column widths have been reset to defaults.")
+                messagebox.showinfo("Column widths", "Column widths have been reset to defaults for the current template.")
             else:
                 messagebox.showwarning("Unavailable", "Reset action is not available.")
 
@@ -2847,14 +3103,13 @@ class SettingsDialog(tk.Toplevel):
 # App entry
 # ===========================
 LAST_ACTIVITY_TS = time.monotonic()
-SILENCE_GUARD_GRACE_SEC = 5.0  # don't auto-stop within first 5s after starting
+SILENCE_GUARD_GRACE_SEC = 5.0
 
 def _boost_process_priority_windows():
     if not sys.platform.startswith("win"):
         return
     try:
         import ctypes
-        # https://learn.microsoft.com/en-us/windows/win32/procthread/scheduling-priorities
         HIGH_PRIORITY_CLASS = 0x00000080
         ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), HIGH_PRIORITY_CLASS)
     except Exception:
@@ -2872,10 +3127,8 @@ if __name__ == "__main__":
     _load_whisper_model(MODEL_KEY)
     _warmup_model()
 
-    # Optional: boost process priority on Windows (safe level)
     _boost_process_priority_windows()
 
-    # Log devices
     try:
         print(f"[Devices] Whisper device={device}; compute_type={COMPUTE_TYPE}; "
               f"Silero device={_silero_device}; torch.cuda={torch.cuda.is_available()}")
