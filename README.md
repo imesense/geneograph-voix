@@ -26,7 +26,7 @@ pip install -r src\geneograph_voix\requirements_cuda.txt --cache-dir .pip
 Pack modules:
 
 ```powershell
-pyinstaller src\geneograph_voix\geneograph_voix.spec
+pyinstaller --clean --noconfirm --distpath dist --workpath build src\geneograph_voix\geneograph_voix.spec
 ```
 
 Deactivate virtual environment:
@@ -34,10 +34,6 @@ Deactivate virtual environment:
 ```powershell
 deactivate
 ```
-
-Build
-pyinstaller --clean --noconfirm --distpath ..\..\dist --workpath ..\..\build .\geneograph_voix.spec
-
 
 ### macOS
 
