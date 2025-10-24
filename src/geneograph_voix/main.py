@@ -507,7 +507,7 @@ model: Optional[WhisperModel] = None
 COMPUTE_TYPE = None
 
 def _pick_default_model_key() -> str:
-    return "large-v3-turbo" if device == "cuda" else "small"
+    return "large-v3-turbo" if device == "cuda" else "base"
 
 def _load_whisper_model(model_key: str):
     global model, COMPUTE_TYPE
@@ -3072,7 +3072,7 @@ class SettingsDialog(tk.Toplevel):
         # Model
         lab(frm, "Model").grid(row=2, column=0, sticky="w", pady=(0,4))
         cur_model_key = initial.get("model_key", _pick_default_model_key())
-        cur_model_label = _MODELKEY_TO_LABEL.get(cur_model_key, "Small")
+        cur_model_label = _MODELKEY_TO_LABEL.get(cur_model_key, "Base")
         self.var_model_label = tk.StringVar(value=cur_model_label)
         if ttk:
             self.cmb_model = ttk.Combobox(frm, state="readonly", values=_MODEL_LABELS,
@@ -3240,14 +3240,6 @@ if __name__ == "__main__":
     _warmup_model()
 
     _boost_process_priority_windows()
-
-    try:
-        print(f"[Devices] Whisper device={device}; compute_type={COMPUTE_TYPE}; "
-              f"Silero device={_silero_device}; torch.cuda={torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            print("[CUDA] device name:", torch.cuda.get_device_name(0))
-    except Exception as _e:
-        print("Device log error:", _e)
 
     root = tk.Tk()
     try:
