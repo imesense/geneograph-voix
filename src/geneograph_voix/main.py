@@ -301,6 +301,7 @@ def _apply_settings_to_globals(s: dict):
     except Exception as e:
         print("settings apply error:", e)
 
+
 def _save_settings_file(s: dict):
     try:
         tmp = os.path.join(os.path.dirname(SETTINGS_FILE) or ".", "~settings.tmp.json")
@@ -1405,6 +1406,21 @@ class SpeechSheetApp:
             _write_templates_file(self._templates_cache)
             self.active_template = t
 
+        # ---- Date columns state (initialize BEFORE UI reads it) ----
+        cols = (self.active_template.get("columns") or [])
+        self._date_cols_columns = [(str(c.get("uid", "")), str(c.get("header", ""))) for c in cols]
+
+        dc = self.active_template.get("date_columns")
+        if isinstance(dc, list):
+            selected = [str(x) for x in dc]
+        else:
+            # Legacy default: preselect headers named "Дата" if template has no date_columns yet
+            selected = [str(c.get("uid", "")) for c in cols
+                        if str(c.get("header", "")).strip().lower() == "дата"]
+
+        self._date_cols_original = set(selected)
+        self._date_cols_pending = set(selected)
+
         # build headers from active template
         self.headers = [col["header"] for col in self.active_template["columns"]]
 
@@ -1661,6 +1677,30 @@ class SpeechSheetApp:
 
     def _active_mapping(self) -> dict:
         return self.active_template.get("mapping", {}) if self.active_template else {}
+    
+    # --- Helpers for date columns ---
+    def _date_columns_set(self) -> set:
+        """Return set of column UIDs configured as date columns for the active template."""
+        try:
+            arr = self.active_template.get("date_columns", [])
+            if isinstance(arr, list):
+                return set(str(x) for x in arr)
+        except Exception:
+            pass
+        return set()
+
+    def _is_date_column(self, col_uid: Optional[str], header_label: str) -> bool:
+        """
+        True if column is marked as a date column in the active template.
+        Legacy fallback: if the template has NO 'date_columns' field yet,
+        treat header 'Дата' as a date column to preserve old behavior.
+        """
+        # If template explicitly has 'date_columns', use it (even if empty)
+        if "date_columns" in (self.active_template or {}):
+            return (col_uid is not None) and (col_uid in self._date_columns_set())
+        # Legacy fallback for older templates
+        return (header_label or "").strip().lower() == "дата"
+
 
     def _column_uid_for_index(self, col_index: int) -> Optional[str]:
         try:
@@ -1884,7 +1924,7 @@ class SpeechSheetApp:
 
         # Processed value (date normalization OR glossary correction + optional name cleanup)
         processed = None
-        if header_label == "Дата":
+        if self._is_date_column(col_uid, header_label):
             value = normalize_date(incoming)
             if value is None:
                 try: self.root.bell()
@@ -2141,6 +2181,20 @@ class SpeechSheetApp:
             except Exception:
                 pass
 
+            # Apply per-template date columns if provided from Settings
+            if isinstance(s.get("date_columns", None), list) and self.active_template:
+                try:
+                    self._reload_templates_cache()
+                    for t in self._templates_cache.get("templates", []):
+                        if t.get("id") == self.active_template.get("id"):
+                            t["date_columns"] = [str(x) for x in s["date_columns"]]
+                            break
+                    _write_templates_file(self._templates_cache)
+                    self._reload_active_template_from_disk()
+                    self._flash_preview_note("📅 Date columns updated", ms=1200)
+                except Exception as e:
+                    print("apply_settings(date_columns) error:", e)
+
             self._start_autosave()
         except Exception as e:
             print("apply_settings error:", e)
@@ -2154,6 +2208,7 @@ class SpeechSheetApp:
             initial=self._current_settings(),
             on_apply=self.apply_settings,
             on_reset_widths=self.reset_column_widths,
+            active_template=self.active_template,
         )
 
     # Listening
@@ -3037,7 +3092,10 @@ class TemplateManagerDialog(tk.Toplevel):
 # Settings dialog (unchanged, except reset widths now per-template)
 # ===========================
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, master, initial: dict, on_apply: Callable[[dict], None], on_reset_widths: Optional[Callable[[], None]] = None):
+    def __init__(self, master, initial: dict, 
+                 on_apply: Callable[[dict], None], 
+                 on_reset_widths: Optional[Callable[[], None]] = None,
+                 active_template: Optional[dict] = None):
         super().__init__(master)
         self.title("Settings")
         self.geometry("650x650")
@@ -3046,6 +3104,23 @@ class SettingsDialog(tk.Toplevel):
         self.on_apply = on_apply
         self.on_reset_widths = on_reset_widths
 
+        # store active template on the dialog
+        self.active_template = active_template or {"columns": [], "date_columns": []}
+
+        # initialize date columns state for this dialog
+        cols = (self.active_template.get("columns") or [])
+        self._date_cols_columns = [(str(c.get("uid", "")), str(c.get("header", ""))) for c in cols]
+
+        dc = self.active_template.get("date_columns")
+        if isinstance(dc, list):
+            selected = [str(x) for x in dc]
+        else:
+            # legacy default if the template has no date_columns: treat "Дата" as date
+            selected = [str(c.get("uid", "")) for c in cols
+                        if str(c.get("header", "")).strip().lower() == "дата"]
+
+        self._date_cols_pending = set(selected)
+
         c = _gfm_palette(True)
         self.configure(bg=c["bg"])
         frm = tk.Frame(self, bg=c["bg"])
@@ -3053,6 +3128,16 @@ class SettingsDialog(tk.Toplevel):
 
         def lab(parent, txt):
             return tk.Label(parent, text=txt, bg=c["bg"], fg=c["text"])
+        
+        def _style_btn_local(b):
+            try:
+                c = _gfm_palette(True)
+                b.configure(bg=c["button_bg"], fg=c["button_fg"],
+                            activebackground=c["button_active_bg"], activeforeground=c["button_fg"],
+                            relief="flat", highlightthickness=1,
+                            highlightbackground=c["button_border"], highlightcolor=c["button_border"])
+            except Exception:
+                pass
 
         # Language
         lab(frm, "Recognition language").grid(row=0, column=0, sticky="w", pady=(0,4))
@@ -3140,6 +3225,37 @@ class SettingsDialog(tk.Toplevel):
         )
         append_box.grid(row=13, column=0, sticky="w", pady=(0,10))
 
+        # Date columns (per current template)
+        def _fmt_date_cols_info():
+            cols = getattr(self, "_date_cols_columns", [])
+            pending = getattr(self, "_date_cols_pending", set())
+            names = [h for (u, h) in cols if u in pending]
+            return ", ".join(names) if names else "— none —"
+
+        lab(frm, "Date columns").grid(row=14, column=0, sticky="w", pady=(10,4))
+        self._date_cols_info = tk.Label(frm, text=_fmt_date_cols_info(), bg=c["bg"], fg=c["muted"])
+
+        def _open_date_columns_dialog():
+            def _on_done(uids):
+                self._date_cols_pending = set(uids)
+                try:
+                    self._date_cols_info.config(text=_fmt_date_cols_info())
+                except Exception:
+                    pass
+
+            DateColumnsDialog(
+                self,
+                columns=self._date_cols_columns,
+                selected_uids=list(self._date_cols_pending),
+                on_done=_on_done
+            )
+
+
+        btn_date_cols = tk.Button(frm, text="Select date columns", command=_open_date_columns_dialog)
+        _style_btn_local(btn_date_cols)
+        btn_date_cols.grid(row=16, column=0, sticky="w", pady=(0,10))
+
+
         # Buttons
         btns = tk.Frame(self, bg=c["bg"])
         btns.pack(fill="x", padx=14, pady=(0,12))
@@ -3170,6 +3286,7 @@ class SettingsDialog(tk.Toplevel):
             except Exception:
                 messagebox.showerror("Invalid value", "UI Scale must be between 0.75 and 2.5.")
                 return
+            
 
             model_label = self.var_model_label.get()
             model_key = _LABEL_TO_MODELKEY.get(model_label, _pick_default_model_key())
@@ -3184,6 +3301,9 @@ class SettingsDialog(tk.Toplevel):
                 "glossary_strictness": max(1, min(5, int(self.var_gloss.get()))),
                 "append_mode": bool(self.var_append.get()),
             }
+
+            s["date_columns"] = list(getattr(self, "_date_cols_pending", set()))
+
             try:
                 self.on_apply(s)
             finally:
@@ -3203,6 +3323,110 @@ class SettingsDialog(tk.Toplevel):
         b_ok = tk.Button(btns, text="Save", command=_save_and_close)
         b_cancel = tk.Button(btns, text="Cancel", command=self.destroy)
         _style_btn(b_ok); _style_btn(b_cancel)
+        b_ok.pack(side="right", padx=(6,0))
+        b_cancel.pack(side="right")
+
+        try:
+            enable_crisp_dark_mode(self, dark=True, delay_ms=0)
+        except Exception:
+            pass
+
+# ===========================
+# Date column dialog
+# ===========================
+class DateColumnsDialog(tk.Toplevel):
+    def __init__(self, master, columns: List[Tuple[str, str]], selected_uids: List[str], on_done: Callable[[List[str]], None]):
+        super().__init__(master)
+        self.title("Select date columns")
+        self.geometry("420x420")
+        self.minsize(360, 320)
+        self.transient(master)
+
+        self.on_done = on_done
+        self._cols = [(str(u or ""), str(h or "")) for (u, h) in columns]
+        pre = set(str(x) for x in (selected_uids or []))
+
+        c = _gfm_palette(True)
+        self.configure(bg=c["bg"])
+
+        tk.Label(self, text="Mark the columns that should receive date normalization:",
+                 bg=c["bg"], fg=c["text"]).pack(anchor="w", padx=12, pady=(12,6))
+
+        # ---- Scrollable check-list ----
+        outer = tk.Frame(self, bg=c["bg"])
+        outer.pack(fill="both", expand=True, padx=12, pady=(0,10))
+
+        canvas = tk.Canvas(outer, bg=c["bg"], highlightthickness=0)
+        vsb = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=c["bg"])
+        canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_cfg(_event=None):
+            inner.update_idletasks()
+            bbox = canvas.bbox(canvas_window)
+            if bbox:
+                canvas.configure(scrollregion=bbox)
+            # keep inner width == canvas width
+            try:
+                canvas.itemconfigure(canvas_window, width=canvas.winfo_width())
+            except Exception:
+                pass
+        inner.bind("<Configure>", _on_cfg)
+        canvas.bind("<Configure>", _on_cfg)
+
+        # vars per column
+        self._vars = {}
+        for uid, header in self._cols:
+            v = tk.BooleanVar(value=(uid in pre))
+            chk = tk.Checkbutton(inner, text=header, variable=v,
+                                 bg=c["bg"], fg=c["text"],
+                                 activebackground=c["bg"], activeforeground=c["text"],
+                                 selectcolor=c.get("surface", "#151a21"), anchor="w")
+            chk.pack(fill="x", anchor="w")
+            self._vars[uid] = v
+
+        # ---- Buttons ----
+        btns = tk.Frame(self, bg=c["bg"]); btns.pack(fill="x", padx=12, pady=(0,12))
+
+        def _style_btn_local(b):
+            try:
+                b.configure(bg=c["button_bg"], fg=c["button_fg"],
+                            activebackground=c["button_active_bg"], activeforeground=c["button_fg"],
+                            relief="flat", highlightthickness=1,
+                            highlightbackground=c["button_border"], highlightcolor=c["button_border"])
+            except Exception:
+                pass
+
+        def _select_all():
+            for v in self._vars.values(): v.set(True)
+
+        def _clear_all():
+            for v in self._vars.values(): v.set(False)
+
+        def _save():
+            chosen = [uid for uid, v in self._vars.items() if v.get()]
+            try:
+                self.on_done(chosen)
+            finally:
+                self.destroy()
+
+        def _cancel():
+            self.destroy()
+
+        b_sel_all = tk.Button(btns, text="Select all", command=_select_all)
+        b_clr_all = tk.Button(btns, text="Clear all", command=_clear_all)
+        b_ok = tk.Button(btns, text="Save", command=_save)
+        b_cancel = tk.Button(btns, text="Cancel", command=_cancel)
+
+        for b in (b_sel_all, b_clr_all, b_ok, b_cancel):
+            _style_btn_local(b)
+
+        b_sel_all.pack(side="left")
+        b_clr_all.pack(side="left", padx=(6,0))
         b_ok.pack(side="right", padx=(6,0))
         b_cancel.pack(side="right")
 
