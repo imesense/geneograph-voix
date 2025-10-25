@@ -1399,6 +1399,7 @@ class SpeechSheetApp:
         self.root = root
         self.root.title("GeneoGraph VoIx")
         self.is_listening = False
+        self._bind_layout_agnostic_ctrl_shortcuts()
 
         # Load glossary lists
         load_glossary_lists()
@@ -1501,6 +1502,7 @@ class SpeechSheetApp:
         self._attach_sheet_bindings_safely()
 
         self._bind_sheet_events()
+        self._install_cross_layout_shortcuts()
         root.grid_rowconfigure(2, weight=1)
         root.grid_columnconfigure(0, weight=1)
 
@@ -1932,6 +1934,53 @@ class SpeechSheetApp:
             rows = len(self.sheet.get_sheet_data())
             self.sheet.set_sheet_data([[""] * len(self.headers) for _ in range(rows)])
 
+
+    def _bind_layout_agnostic_ctrl_shortcuts(self):
+        """
+        Make Ctrl+<letter> shortcuts work across keyboard layouts by mapping
+        RU/UK Cyrillic letters to their Latin counterparts and re-emitting the
+        Latin combo to the currently-focused widget.
+        """
+        # Cyrillic -> Latin for common shortcuts
+        # Copy(C), Paste(V), Cut(X), Undo(Z), Redo(Y/Ctrl+Shift+Z), SelectAll(A), Find(F)
+        cyr2lat = {
+            "с": "c", "С": "c",   # C
+            "м": "v", "М": "v",   # V
+            "ч": "x", "Ч": "x",   # X
+            "я": "z", "Я": "z",   # Z
+            "н": "y", "Н": "y",   # Y
+            "ф": "a", "Ф": "a",   # A
+            "а": "f", "А": "f",   # F
+        }
+
+        def _handler(event):
+            ks = getattr(event, "keysym", "")
+            mapped = cyr2lat.get(ks)
+            if not mapped:
+                return  # not a Cyrillic accelerator we care about
+
+            w = self.root.focus_get()
+            if not w:
+                return
+
+            # Build the sequence to emit. For redo we also support Ctrl+Shift+Z.
+            # In Tk, Shift mask is 0x0001, Control is 0x0004 (we already know Control is down).
+            shift_down = bool(getattr(event, "state", 0) & 0x0001)
+
+            seq = f"<Control-{mapped}>"
+            if mapped == "z" and shift_down:
+                seq = "<Control-Shift-z>"
+
+            try:
+                w.event_generate(seq)
+                return "break"  # stop the original <Control-<cyrillic>> from bubbling
+            except Exception:
+                # If anything goes wrong, just let the original event pass through.
+                return
+
+        # Bind globally; add="+" so we don’t clobber existing bindings.
+        self.root.bind_all("<Control-KeyPress>", _handler, add="+")
+
     # --- Persist column widths per template ---
     def _persist_column_widths_to_template(self):
         widths = None
@@ -2234,6 +2283,138 @@ class SpeechSheetApp:
         self.root.bind_all("<F1>", toggle_evt, add="+")
         for seq in ("<Escape>", "<KeyPress-Escape>"):
             self.root.bind_all(seq, stop_evt, add="+")
+
+    def _install_cross_layout_shortcuts(self):
+        """
+        Make Ctrl+<letter> work for any keyboard layout by tracking Ctrl state
+        and using layout-agnostic `event.keycode`. Keeps existing names/calls.
+        """
+        if getattr(self, "_xl_keys_installed", False):
+            return
+        self._xl_keys_installed = True
+        self._ctrl_down = False
+
+        # --- Track Ctrl state (layout/version agnostic) ---
+        def _ctrl_on(_=None):  self._ctrl_down = True
+        def _ctrl_off(_=None): self._ctrl_down = False
+        for seq in ("<KeyPress-Control_L>", "<KeyPress-Control_R>"):
+            self.root.bind_all(seq, _ctrl_on, add="+")
+        for seq in ("<KeyRelease-Control_L>", "<KeyRelease-Control_R>", "<FocusOut>"):
+            self.root.bind_all(seq, _ctrl_off, add="+")
+
+        # Windows/Tk vk codes for letters (works across layouts with Ctrl held)
+        VK = {"A": 65, "C": 67, "V": 86, "X": 88, "Z": 90, "Y": 89, "F": 70}
+        code2action = {
+            VK["C"]: "copy",
+            VK["V"]: "paste",
+            VK["X"]: "cut",
+            VK["Z"]: "undo",
+            VK["Y"]: "redo",
+            VK["A"]: "select_all",
+            VK["F"]: "find",
+        }
+        # Minimal keysym fallback (covers some non-Windows Tk builds)
+        ks2action = {
+            "c": "copy", "v": "paste", "x": "cut", "z": "undo", "y": "redo",
+            "a": "select_all", "f": "find",
+        }
+
+        def _dispatch_to_focus(action: str, shift_down: bool = False):
+            w = self.root.focus_get() or self.root
+
+            # 1) tksheet: send the Latin combo to the Sheet widget so its own bindings run
+            try:
+                import tksheet
+                target = None
+                if isinstance(w, tksheet.Sheet):
+                    target = w
+                elif isinstance(getattr(w, "master", None), tksheet.Sheet):
+                    target = w.master
+                if target is not None:
+                    seq = {
+                        "copy": "<Control-c>",
+                        "paste": "<Control-v>",
+                        "cut": "<Control-x>",
+                        "undo": "<Control-z>",
+                        "redo": "<Control-Shift-Z>",
+                        "select_all": "<Control-a>",
+                        "find": "<Control-f>",
+                    }[action]
+                    target.event_generate(seq)
+                    return "break"
+            except Exception:
+                pass
+
+            # 2) Native Tk editors
+            if isinstance(w, (tk.Entry, tk.Text)):
+                try:
+                    if action == "copy":
+                        w.event_generate("<<Copy>>")
+                    elif action == "paste":
+                        w.event_generate("<<Paste>>")
+                    elif action == "cut":
+                        w.event_generate("<<Cut>>")
+                    elif action == "select_all":
+                        try: w.event_generate("<<SelectAll>>")
+                        except Exception:
+                            try: w.selection_range(0, "end"); w.icursor("end")
+                            except Exception: pass
+                    elif action == "undo":
+                        try: w.event_generate("<<Undo>>")
+                        except Exception: w.event_generate("<Control-z>")
+                    elif action == "redo":
+                        w.event_generate("<Control-Shift-z>")
+                    elif action == "find":
+                        self.root.event_generate("<Control-f>")
+                    return "break"
+                except Exception:
+                    pass
+
+            # 3) Fallback to root
+            try:
+                seq = {
+                    "copy": "<Control-c>",
+                    "paste": "<Control-v>",
+                    "cut": "<Control-x>",
+                    "undo": "<Control-z>",
+                    "redo": "<Control-Shift-Z>",
+                    "select_all": "<Control-a>",
+                    "find": "<Control-f>",
+                }[action]
+                self.root.event_generate(seq)
+                return "break"
+            except Exception:
+                return
+
+        def _on_any_key(event):
+            # Only act if our tracked Ctrl is down
+            if not getattr(self, "_ctrl_down", False):
+                return
+
+            # If Tk already reports ASCII keysym (English layout), let native handlers run
+            ks = (getattr(event, "keysym", "") or "").lower()
+            if ks in ks2action:
+                return  # avoid double-firing on EN layout
+
+            code = int(getattr(event, "keycode", 0) or 0)
+            action = code2action.get(code)
+
+            if action is None:
+                # Fallback: some builds give odd codes; try keysym mapping
+                action = ks2action.get(ks)
+
+            if not action:
+                return
+
+            shift_down = bool(getattr(event, "state", 0) & 0x0001)
+            if action == "undo" and shift_down:
+                action = "redo"
+
+            return _dispatch_to_focus(action, shift_down=shift_down)
+
+        # Use KeyPress and keep existing bindings with add="+"
+        self.root.bind_all("<KeyPress>", _on_any_key, add="+")
+
 
     def _current_settings(self) -> dict:
         return {
