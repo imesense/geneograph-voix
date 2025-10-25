@@ -1399,7 +1399,6 @@ class SpeechSheetApp:
         self.root = root
         self.root.title("GeneoGraph VoIx")
         self.is_listening = False
-        self._bind_layout_agnostic_ctrl_shortcuts()
 
         # Load glossary lists
         load_glossary_lists()
@@ -1500,9 +1499,10 @@ class SpeechSheetApp:
 
         self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
         self._attach_sheet_bindings_safely()
+        self._hk_in_dispatch = False  # re-entrancy guard for hotkey interceptor
 
         self._bind_sheet_events()
-        self._install_cross_layout_shortcuts()
+        self._install_cross_layout_shortcuts(force=True)
         root.grid_rowconfigure(2, weight=1)
         root.grid_columnconfigure(0, weight=1)
 
@@ -1554,41 +1554,15 @@ class SpeechSheetApp:
 
     # ------- Template helpers -------
     def _bind_sheet_events(self):
-        """Attach tksheet event handlers once per sheet instance, using tuple-form only."""
-        def _end_edit_header_cb(*_a, **_k):
-            try:
-                self._on_end_edit_header()
-            except Exception as e:
-                print("end_edit_header cb error:", e)
-
-        def _column_dnd_cb(*_a, **_k):
-            try:
-                self._persist_column_order_to_template()
-            except Exception as e:
-                print("column_drag_and_drop cb error:", e)
-
-        def _attach_one(name, cb):
-            try:
-                # Only the canonical list-of-tuples shape; no kwargs, no dict.
-                self.sheet.extra_bindings([(name, cb)])
-                return True
-            except Exception as e:
-                print(f"extra_bindings attach error for '{name}':", repr(e))
-                return False
-
-        def _attach_all():
-            # 1) Header edit finished
-            _attach_one("end_edit_header", _end_edit_header_cb)
-
-            # 2) Column drag-and-drop (different names across tksheet builds)
-            if not _attach_one("column_drag_and_drop", _column_dnd_cb):
-                _attach_one("drag_and_drop", _column_dnd_cb)  # fallback alias
-
-        # Defer until widget is realized; avoids attach timing errors.
+        """Attach tksheet event handlers once per sheet instance."""
         try:
-            self.sheet.after_idle(_attach_all)
-        except Exception:
-            self.sheet.after(0, _attach_all)
+            self.sheet.extra_bindings(bindings={
+                "end_edit_header": self._on_end_edit_header,
+                "column_drag_and_drop": lambda e: self._persist_column_order_to_template(),
+                "begin_edit_cell": lambda e: self._ensure_editor_hotkey_tag(), 
+            })
+        except Exception as e:
+            print("extra_bindings attach error:", e)
 
     def _attach_sheet_bindings_safely(self):
         """Enable base tksheet bindings after the widget is realized; supports both iterable and varargs APIs."""
@@ -1642,6 +1616,7 @@ class SpeechSheetApp:
             self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
             self._attach_sheet_bindings_safely()
             self._bind_sheet_events()
+            self._install_cross_layout_shortcuts(force=True)
             self._try_style()
             self.sheet.set_sheet_data(data)
             self.load_column_widths()
@@ -1705,6 +1680,7 @@ class SpeechSheetApp:
         self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
         self._attach_sheet_bindings_safely()
         self._bind_sheet_events()
+        self._install_cross_layout_shortcuts(force=True)
         self._try_style()
         # Load data for the new template
         self.load_data()
@@ -1934,53 +1910,6 @@ class SpeechSheetApp:
             rows = len(self.sheet.get_sheet_data())
             self.sheet.set_sheet_data([[""] * len(self.headers) for _ in range(rows)])
 
-
-    def _bind_layout_agnostic_ctrl_shortcuts(self):
-        """
-        Make Ctrl+<letter> shortcuts work across keyboard layouts by mapping
-        RU/UK Cyrillic letters to their Latin counterparts and re-emitting the
-        Latin combo to the currently-focused widget.
-        """
-        # Cyrillic -> Latin for common shortcuts
-        # Copy(C), Paste(V), Cut(X), Undo(Z), Redo(Y/Ctrl+Shift+Z), SelectAll(A), Find(F)
-        cyr2lat = {
-            "с": "c", "С": "c",   # C
-            "м": "v", "М": "v",   # V
-            "ч": "x", "Ч": "x",   # X
-            "я": "z", "Я": "z",   # Z
-            "н": "y", "Н": "y",   # Y
-            "ф": "a", "Ф": "a",   # A
-            "а": "f", "А": "f",   # F
-        }
-
-        def _handler(event):
-            ks = getattr(event, "keysym", "")
-            mapped = cyr2lat.get(ks)
-            if not mapped:
-                return  # not a Cyrillic accelerator we care about
-
-            w = self.root.focus_get()
-            if not w:
-                return
-
-            # Build the sequence to emit. For redo we also support Ctrl+Shift+Z.
-            # In Tk, Shift mask is 0x0001, Control is 0x0004 (we already know Control is down).
-            shift_down = bool(getattr(event, "state", 0) & 0x0001)
-
-            seq = f"<Control-{mapped}>"
-            if mapped == "z" and shift_down:
-                seq = "<Control-Shift-z>"
-
-            try:
-                w.event_generate(seq)
-                return "break"  # stop the original <Control-<cyrillic>> from bubbling
-            except Exception:
-                # If anything goes wrong, just let the original event pass through.
-                return
-
-        # Bind globally; add="+" so we don’t clobber existing bindings.
-        self.root.bind_all("<Control-KeyPress>", _handler, add="+")
-
     # --- Persist column widths per template ---
     def _persist_column_widths_to_template(self):
         widths = None
@@ -2025,6 +1954,7 @@ class SpeechSheetApp:
         self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
         self._attach_sheet_bindings_safely()
         self._bind_sheet_events()
+        self._install_cross_layout_shortcuts(force=True)
         self.sheet.set_sheet_data(data)
         self._try_style()
 
@@ -2284,137 +2214,197 @@ class SpeechSheetApp:
         for seq in ("<Escape>", "<KeyPress-Escape>"):
             self.root.bind_all(seq, stop_evt, add="+")
 
-    def _install_cross_layout_shortcuts(self):
-        """
-        Make Ctrl+<letter> work for any keyboard layout by tracking Ctrl state
-        and using layout-agnostic `event.keycode`. Keeps existing names/calls.
-        """
-        if getattr(self, "_xl_keys_installed", False):
-            return
-        self._xl_keys_installed = True
-        self._ctrl_down = False
+    # ===== Cross-layout Ctrl shortcuts (works for RU/UK layouts) =====
+    def _install_cross_layout_shortcuts(self, force: bool = False):
+        try:
+            tag = "HotkeyTag"
 
-        # --- Track Ctrl state (layout/version agnostic) ---
-        def _ctrl_on(_=None):  self._ctrl_down = True
-        def _ctrl_off(_=None): self._ctrl_down = False
-        for seq in ("<KeyPress-Control_L>", "<KeyPress-Control_R>"):
-            self.root.bind_all(seq, _ctrl_on, add="+")
-        for seq in ("<KeyRelease-Control_L>", "<KeyRelease-Control_R>", "<FocusOut>"):
-            self.root.bind_all(seq, _ctrl_off, add="+")
-
-        # Windows/Tk vk codes for letters (works across layouts with Ctrl held)
-        VK = {"A": 65, "C": 67, "V": 86, "X": 88, "Z": 90, "Y": 89, "F": 70}
-        code2action = {
-            VK["C"]: "copy",
-            VK["V"]: "paste",
-            VK["X"]: "cut",
-            VK["Z"]: "undo",
-            VK["Y"]: "redo",
-            VK["A"]: "select_all",
-            VK["F"]: "find",
-        }
-        # Minimal keysym fallback (covers some non-Windows Tk builds)
-        ks2action = {
-            "c": "copy", "v": "paste", "x": "cut", "z": "undo", "y": "redo",
-            "a": "select_all", "f": "find",
-        }
-
-        def _dispatch_to_focus(action: str, shift_down: bool = False):
-            w = self.root.focus_get() or self.root
-
-            # 1) tksheet: send the Latin combo to the Sheet widget so its own bindings run
+            # Attach our tag to every widget that can get focus inside tksheet
+            candidates = []
             try:
-                import tksheet
-                target = None
-                if isinstance(w, tksheet.Sheet):
-                    target = w
-                elif isinstance(getattr(w, "master", None), tksheet.Sheet):
-                    target = w.master
-                if target is not None:
-                    seq = {
-                        "copy": "<Control-c>",
-                        "paste": "<Control-v>",
-                        "cut": "<Control-x>",
-                        "undo": "<Control-z>",
-                        "redo": "<Control-Shift-Z>",
-                        "select_all": "<Control-a>",
-                        "find": "<Control-f>",
-                    }[action]
-                    target.event_generate(seq)
-                    return "break"
+                candidates.append(self.sheet)
             except Exception:
                 pass
+            for name in ("MT", "main_table", "top_left", "row_index", "col_index"):
+                w = getattr(self.sheet, name, None)
+                if w and hasattr(w, "winfo_exists") and w.winfo_exists():
+                    candidates.append(w)
 
-            # 2) Native Tk editors
-            if isinstance(w, (tk.Entry, tk.Text)):
+            for w in candidates:
                 try:
-                    if action == "copy":
-                        w.event_generate("<<Copy>>")
-                    elif action == "paste":
-                        w.event_generate("<<Paste>>")
-                    elif action == "cut":
-                        w.event_generate("<<Cut>>")
-                    elif action == "select_all":
-                        try: w.event_generate("<<SelectAll>>")
-                        except Exception:
-                            try: w.selection_range(0, "end"); w.icursor("end")
-                            except Exception: pass
-                    elif action == "undo":
-                        try: w.event_generate("<<Undo>>")
-                        except Exception: w.event_generate("<Control-z>")
-                    elif action == "redo":
-                        w.event_generate("<Control-Shift-z>")
-                    elif action == "find":
-                        self.root.event_generate("<Control-f>")
-                    return "break"
+                    tags = list(w.bindtags())
+                    if tag in tags:
+                        if force:
+                            tags.remove(tag)
+                        else:
+                            continue
+                    tags.insert(0, tag)  # run before tksheet
+                    w.bindtags(tuple(tags))
                 except Exception:
                     pass
 
-            # 3) Fallback to root
+            # Bind the tag handlers once
+            self.root.bind_class(tag, "<KeyPress>",   self._hotkey_interceptor, add="+")
+            self.root.bind_class(tag, "<KeyRelease>", self._hotkey_interceptor, add="+")
+        except Exception as e:
+            print("hotkeys install error:", e)
+
+        # Track the in-cell editor, which is created/destroyed dynamically
+        self._ensure_editor_hotkey_tag()
+
+    def _ensure_editor_hotkey_tag(self):
+        try:
+            tag = "HotkeyTag"
+            mt = getattr(self.sheet, "MT", None) or getattr(self.sheet, "main_table", None)
+            ed = getattr(mt, "text_editor", None)
+            if ed and ed.winfo_exists():
+                tags = list(ed.bindtags())
+                if tag not in tags:
+                    tags.insert(0, tag)
+                    ed.bindtags(tuple(tags))
+        except Exception:
+            pass
+        finally:
             try:
-                seq = {
-                    "copy": "<Control-c>",
-                    "paste": "<Control-v>",
-                    "cut": "<Control-x>",
-                    "undo": "<Control-z>",
-                    "redo": "<Control-Shift-Z>",
-                    "select_all": "<Control-a>",
-                    "find": "<Control-f>",
-                }[action]
-                self.root.event_generate(seq)
-                return "break"
+                self.root.after(200, self._ensure_editor_hotkey_tag)
             except Exception:
+                pass
+
+    def _ctrl_os_down(self) -> bool:
+        try:
+            import sys
+            if sys.platform.startswith("win"):
+                import ctypes
+                VK_CONTROL  = 0x11
+                VK_LCONTROL = 0xA2
+                VK_RCONTROL = 0xA3
+                GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
+                return bool((GetAsyncKeyState(VK_CONTROL)  & 0x8000) or
+                            (GetAsyncKeyState(VK_LCONTROL) & 0x8000) or
+                            (GetAsyncKeyState(VK_RCONTROL) & 0x8000))
+            # Non-Windows: could maintain a flag from Control press if needed
+            return False
+        except Exception:
+            return False
+
+    def _hotkey_interceptor(self, event):
+        # Re-entrancy guard: prevents recursive re-entry from any indirect calls
+        if getattr(self, "_hk_in_dispatch", False):
+            return
+
+        try:
+            et = getattr(event, "type", None)
+            # accept numeric and textual KeyPress
+            if et not in (2, "2", "KeyPress"):
                 return
 
-        def _on_any_key(event):
-            # Only act if our tracked Ctrl is down
-            if not getattr(self, "_ctrl_down", False):
+            # If Control is not physically down (OS-level on Windows), ignore
+            if not self._ctrl_os_down():
                 return
-
-            # If Tk already reports ASCII keysym (English layout), let native handlers run
-            ks = (getattr(event, "keysym", "") or "").lower()
-            if ks in ks2action:
-                return  # avoid double-firing on EN layout
 
             code = int(getattr(event, "keycode", 0) or 0)
-            action = code2action.get(code)
-
-            if action is None:
-                # Fallback: some builds give odd codes; try keysym mapping
-                action = ks2action.get(ks)
-
+            action = {
+                65: "select_all",  # A
+                67: "copy",        # C
+                86: "paste",       # V
+                88: "cut",         # X
+                89: "redo",        # Y
+                90: "undo",        # Z
+            }.get(code)
             if not action:
                 return
 
-            shift_down = bool(getattr(event, "state", 0) & 0x0001)
-            if action == "undo" and shift_down:
-                action = "redo"
+            self._hk_in_dispatch = True
+            try:
+                w = self.root.focus_get()
+                handled = False
+                if isinstance(w, tk.Text):
+                    handled = self._dispatch_text_hotkey(w, action)
+                elif isinstance(w, tk.Entry):
+                    handled = self._dispatch_entry_hotkey(w, action)
+                else:
+                    handled = self._dispatch_sheet_hotkey(action)
 
-            return _dispatch_to_focus(action, shift_down=shift_down)
+                if handled:
+                    return "break"
+            finally:
+                self._hk_in_dispatch = False
 
-        # Use KeyPress and keep existing bindings with add="+"
-        self.root.bind_all("<KeyPress>", _on_any_key, add="+")
+        except Exception as e:
+            # keep app alive; show once if you want
+            print("hotkey interceptor error:", e)
 
+    def _dispatch_entry_hotkey(self, entry: tk.Entry, action: str) -> bool:
+        try:
+            if action == "select_all":
+                entry.select_range(0, "end")
+                entry.icursor("end")
+                return True
+            ev = {
+                "copy":  "<<Copy>>",
+                "paste": "<<Paste>>",
+                "cut":   "<<Cut>>",
+                "undo":  "<<Undo>>",
+                "redo":  "<<Redo>>",
+            }.get(action)
+            if ev:
+                entry.event_generate(ev)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _dispatch_text_hotkey(self, text: tk.Text, action: str) -> bool:
+        try:
+            if action == "select_all":
+                text.tag_add("sel", "1.0", "end-1c")
+                text.mark_set("insert", "end-1c")
+                text.see("insert")
+                return True
+            ev = {
+                "copy":  "<<Copy>>",
+                "paste": "<<Paste>>",
+                "cut":   "<<Cut>>",
+                "undo":  "<<Undo>>",
+                "redo":  "<<Redo>>",
+            }.get(action)
+            if ev:
+                text.event_generate(ev)
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _dispatch_sheet_hotkey(self, action: str) -> bool:
+        """Dispatch Ctrl+X/C/V/Z/Y/A for the tksheet grid without generating KeyPress events."""
+        try:
+            mt = getattr(self.sheet, "MT", None) or getattr(self.sheet, "main_table", None) or self.sheet
+
+            # Preferred: call tksheet handlers / public APIs directly (no KeyPress events)
+            method_map = {
+                "copy":       ("ctrl_c", "copy", "copy_to_clipboard"),
+                "paste":      ("ctrl_v", "paste", "paste_from_clipboard"),
+                "cut":        ("ctrl_x", "cut"),
+                "undo":       ("ctrl_z", "undo"),
+                "redo":       ("ctrl_y", "redo"),
+                "select_all": ("ctrl_a", "select_all"),
+            }
+            targets = [mt, self.sheet]
+            for target in targets:
+                for mname in method_map[action]:
+                    fn = getattr(target, mname, None)
+                    if callable(fn):
+                        try:
+                            fn(None)   # many ctrl_* handlers accept an event; None is fine
+                        except TypeError:
+                            fn()      # some public methods take no args
+                        return True
+
+            # As a last resort (shouldn’t be needed), you could implement your own clipboard copy/paste here.
+            # But on normal tksheet versions at least one method above exists.
+        except Exception as e:
+            print("sheet hotkey error:", e)
+        return False
 
     def _current_settings(self) -> dict:
         return {
