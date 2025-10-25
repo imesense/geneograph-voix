@@ -1571,7 +1571,6 @@ class SpeechSheetApp:
         except Exception as e:
             print("end_edit_header persist error:", e)
 
-
     def _rebuild_sheet(self, new_headers: list[str], data: list[list[str]]):
         with self.preserve_column_widths():
             try:
@@ -1669,6 +1668,18 @@ class SpeechSheetApp:
         _clear_best_caches()
         GLOSSARIES.clear()
 
+    # --- Append mode columns helpers (per-template) ---
+    def _append_columns_set(self) -> set:
+        try:
+            arr = self.active_template.get("append_columns", [])
+            if isinstance(arr, list):
+                return set(str(x) for x in arr)
+        except Exception:
+            pass
+        return set()
+
+    def _is_append_column(self, col_uid: Optional[str]) -> bool:
+        return (col_uid is not None) and (col_uid in self._append_columns_set())
 
     def _current_headers_list(self) -> list[str]:
         # Try multiple tksheet APIs; fall back to our cached headers
@@ -2013,19 +2024,17 @@ class SpeechSheetApp:
         if not processed:
             return
 
-        if APPEND_MODE:
+        if self._is_append_column(col_uid):
             try:
                 existing = self.sheet.get_cell_data(row, col) or ""
             except Exception:
                 existing = ""
             existing = str(existing).strip()
-            if existing:
-                new_value = (existing + " " + processed).strip()
-            else:
-                new_value = processed
+            new_value = (existing + " " + processed).strip() if existing else processed
             self.sheet.set_cell_data(row, col, new_value)
         else:
             self.sheet.set_cell_data(row, col, processed)
+
 
 
     def open_glossary_editor(self):
@@ -2266,6 +2275,20 @@ class SpeechSheetApp:
                     self._flash_preview_note("📅 Date columns updated", ms=1200)
                 except Exception as e:
                     print("apply_settings(date_columns) error:", e)
+
+            # Apply per-template append columns if provided from Settings
+            if isinstance(s.get("append_columns", None), list) and self.active_template:
+                try:
+                    self._reload_templates_cache()
+                    for t in self._templates_cache.get("templates", []):
+                        if t.get("id") == self.active_template.get("id"):
+                            t["append_columns"] = [str(x) for x in s["append_columns"]]
+                            break
+                    _write_templates_file(self._templates_cache)
+                    self._reload_active_template_from_disk()
+                    self._flash_preview_note("➕ Append columns updated", ms=1200)
+                except Exception as e:
+                    print("apply_settings(append_columns) error:", e)
 
             self._start_autosave()
         except Exception as e:
@@ -3377,27 +3400,23 @@ class SettingsDialog(tk.Toplevel):
 
         frm.grid_columnconfigure(0, weight=1)
 
-        # Append mode
-        self.var_append = tk.BooleanVar(value=bool(initial.get("append_mode", False)))
-        append_box = tk.Checkbutton(
-            frm,
-            text="Append mode (append to cell instead of replacing)",
-            variable=self.var_append,
-            bg=c["bg"], fg=c["text"],
-            activebackground=c["bg"], activeforeground=c["text"],
-            selectcolor=c.get("surface", "#151a21")
-        )
-        append_box.grid(row=13, column=0, sticky="w", pady=(0,10))
-
         # Date columns (per current template)
         def _fmt_date_cols_info():
             cols = getattr(self, "_date_cols_columns", [])
             pending = getattr(self, "_date_cols_pending", set())
             names = [h for (u, h) in cols if u in pending]
-            return ", ".join(names) if names else "— none —"
+            if not cols:
+                return "No columns available"
+            if not names:
+                return "None selected"
+            preview = ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
+            return f"{len(names)}/{len(cols)} selected  ({preview})"
+
+        
 
         lab(frm, "Apply Date formatting to columns").grid(row=14, column=0, sticky="w", pady=(10,4))
         self._date_cols_info = tk.Label(frm, text=_fmt_date_cols_info(), bg=c["bg"], fg=c["muted"])
+        self._date_cols_info.grid(row=15, column=0, sticky="w", pady=(0,6))
 
         def _open_date_columns_dialog():
             def _on_done(uids):
@@ -3419,6 +3438,54 @@ class SettingsDialog(tk.Toplevel):
         _style_btn_local(btn_date_cols)
         btn_date_cols.grid(row=16, column=0, sticky="w", pady=(0,10))
 
+        # --- Append columns (per current template) ---
+        def _fmt_append_cols_info():
+            cols = getattr(self, "_append_cols_columns", [])
+            pending = getattr(self, "_append_cols_pending", set())
+            names = [h for (u, h) in cols if u in pending]
+            if not cols:
+                return "No columns available"
+            if not names:
+                return "None selected"
+            preview = ", ".join(names[:3]) + ("…" if len(names) > 3 else "")
+            return f"{len(names)}/{len(cols)} selected  ({preview})"
+
+        # Lazy-init from active_template only when needed
+        def _ensure_append_state():
+            if not hasattr(self, "_append_cols_columns"):
+                cols = (self.active_template.get("columns") or [])
+                self._append_cols_columns = [(str(c.get("uid", "")), str(c.get("header", ""))) for c in cols]
+            if not hasattr(self, "_append_cols_pending"):
+                dc = self.active_template.get("append_columns")
+                if isinstance(dc, list):
+                    selected = [str(x) for x in dc]
+                else:
+                    selected = []  # default: no append columns
+                self._append_cols_pending = set(selected)
+
+        lab(frm, "Append mode columns (append to cell instead of replacing)").grid(row=17, column=0, sticky="w", pady=(10,4))
+        _ensure_append_state()
+        self._append_cols_info = tk.Label(frm, text=_fmt_append_cols_info(), bg=c["bg"], fg=c["muted"])
+        self._append_cols_info.grid(row=18, column=0, sticky="w", pady=(0,6))
+
+        def _open_append_columns_dialog():
+            _ensure_append_state()
+            def _on_done(uids):
+                self._append_cols_pending = set(uids)
+                try:
+                    self._append_cols_info.config(text=_fmt_append_cols_info())
+                except Exception:
+                    pass
+
+            AppendColumnsDialog(self,
+                                columns=self._append_cols_columns,
+                                selected_uids=list(self._append_cols_pending),
+                                on_done=_on_done)
+
+        btn_append_cols = tk.Button(frm, text="Select append columns", command=_open_append_columns_dialog)
+        _style_btn_local(btn_append_cols)
+        btn_append_cols.grid(row=19, column=0, sticky="w", pady=(0,10))
+
 
         # Buttons
         btns = tk.Frame(self, bg=c["bg"])
@@ -3436,6 +3503,7 @@ class SettingsDialog(tk.Toplevel):
         def _save_and_close():
             sel_label = self.var_lang_label.get()
             lang_code = _LABEL_TO_CODE.get(sel_label, "auto")
+            _ensure_append_state()
 
             try:
                 auto_m = max(1, int(self.var_auto.get()))
@@ -3463,7 +3531,7 @@ class SettingsDialog(tk.Toplevel):
                 "speed_mode": bool(self.var_speed.get()),
                 "vad_strictness": max(1, min(5, int(self.var_vad.get()))),
                 "glossary_strictness": max(1, min(5, int(self.var_gloss.get()))),
-                "append_mode": bool(self.var_append.get()),
+                "append_columns": list(self._append_cols_pending),
             }
 
             s["date_columns"] = list(getattr(self, "_date_cols_pending", set()))
@@ -3593,6 +3661,113 @@ class DateColumnsDialog(tk.Toplevel):
         b_clr_all.pack(side="left", padx=(6,0))
         b_ok.pack(side="right", padx=(6,0))
         b_cancel.pack(side="right")
+
+        try:
+            enable_crisp_dark_mode(self, dark=True, delay_ms=0)
+        except Exception:
+            pass
+
+# ===========================
+# Append column dialog
+# ===========================
+
+class AppendColumnsDialog(tk.Toplevel):
+    def __init__(self, master, columns: List[Tuple[str, str]], selected_uids: List[str],
+                 on_done: Callable[[List[str]], None]):
+        super().__init__(master)
+        self.title("Select columns for Append mode")
+        self.geometry("420x420")
+        self.minsize(360, 320)
+        self.transient(master)
+
+        self.on_done = on_done
+        self._cols = [(str(u or ""), str(h or "")) for (u, h) in columns]
+        self._sel = set(str(x) for x in (selected_uids or []))
+
+        c = _gfm_palette(True)
+        self.configure(bg=c["bg"])
+
+        tk.Label(self, text="Mark the columns where new text should be APPENDED:",
+                 bg=c["bg"], fg=c["text"]).pack(anchor="w", padx=12, pady=(12, 6))
+
+        # --- Scrollable check-list with a little left padding for each checkbox ---
+        wrap = tk.Frame(self, bg=c["bg"])
+        wrap.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        canvas = tk.Canvas(wrap, bg=c["bg"], highlightthickness=0)
+        vs = tk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=c["bg"])
+
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=vs.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+
+        self._check_vars: list[tuple[str, tk.BooleanVar]] = []
+        for uid, header in self._cols:
+            row = tk.Frame(inner, bg=c["bg"])
+            row.pack(anchor="w", fill="x", padx=12, pady=2)
+
+            # left spacer (visual separation like in the Date dialog)
+            tk.Label(row, text=" ", width=1, bg=c["bg"]).pack(side="left")
+
+            var = tk.BooleanVar(value=(uid in self._sel))
+            cb = tk.Checkbutton(
+                row, text=header, variable=var, anchor="w",
+                bg=c["bg"], fg=c["text"],
+                activebackground=c["bg"], activeforeground=c["text"],
+                selectcolor=c.get("surface", "#151a21")
+            )
+            cb.pack(side="left", fill="x", expand=True)
+            self._check_vars.append((uid, var))
+
+        # --- Buttons (same 4 buttons and layout as the Date columns dialog) ---
+        btns = tk.Frame(self, bg=c["bg"])
+        btns.pack(fill="x", padx=12, pady=(0, 12))
+
+        def _style_btn_local(b):
+            try:
+                b.configure(bg=c["button_bg"], fg=c["button_fg"],
+                            activebackground=c["button_active_bg"], activeforeground=c["button_fg"],
+                            relief="flat", highlightthickness=1,
+                            highlightbackground=c["button_border"], highlightcolor=c["button_border"])
+            except Exception:
+                pass
+
+        def _select_all():
+            for _, v in self._check_vars:
+                v.set(True)
+
+        def _clear_all():
+            for _, v in self._check_vars:
+                v.set(False)
+
+        def _cancel():
+            self.destroy()
+
+        def _save():
+            chosen = [uid for (uid, v) in self._check_vars if v.get()]
+            try:
+                self.on_done(chosen)
+            finally:
+                self.destroy()
+
+        b_select_all = tk.Button(btns, text="Select all", command=_select_all)
+        b_clear_all  = tk.Button(btns, text="Clear all",  command=_clear_all)
+        b_cancel     = tk.Button(btns, text="Cancel",     command=_cancel)
+        b_save       = tk.Button(btns, text="Save",       command=_save)
+
+        for b in (b_select_all, b_clear_all, b_cancel, b_save):
+            _style_btn_local(b)
+
+        # Layout: left -> Select all ; right -> Clear all, Cancel, Save (exactly like Date dialog)
+        b_select_all.pack(side="left")
+        b_clear_all.pack(side="left", padx=(6, 0))
+        b_save.pack(side="right", padx=(6, 0))
+        b_cancel.pack(side="right")
+
 
         try:
             enable_crisp_dark_mode(self, dark=True, delay_ms=0)
