@@ -404,10 +404,22 @@ def load_glossary_lists():
 
 def save_glossary_lists():
     obj = GLOSSARY_LISTS if isinstance(GLOSSARY_LISTS, dict) else {"lists": {}}
+    lists = obj.get("lists", {})
+
+    import unicodedata
+    def _key(name: str) -> str:
+        t = unicodedata.normalize("NFKD", str(name or "")).casefold()
+        t = "".join(ch for ch in t if not unicodedata.combining(ch))
+        return t.replace("ё", "е")
+
+    items = sorted(lists.items(), key=lambda kv: _key(kv[1].get("name", "")))
+    obj = {"lists": {lid: rec for lid, rec in items}}
+
     tmp = os.path.join(os.path.dirname(GLOSSARIES_FILE) or ".", "~glossaries.tmp.json")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
     os.replace(tmp, GLOSSARIES_FILE)
+
 
 # =========================================
 # Glossary + text utilities (adapted)
@@ -2976,6 +2988,8 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
         bot_term = tk.Frame(mid, bg=c["bg"]); bot_term.pack(fill="x", pady=(6,0))
         self.term_entry = tk.Entry(bot_term, relief="flat", bg=c["surface"], fg=c["text"])
         self.term_entry.pack(side="left", fill="x", expand=True, padx=(0,6))
+        self.term_entry.bind("<Return>", self._add_term)      # main Enter
+        self.term_entry.bind("<KP_Enter>", self._add_term)    # keypad Enter
         b_add_t = tk.Button(bot_term, text="Add term", command=self._add_term)
         b_del_t = tk.Button(bot_term, text="Remove term", command=self._remove_term)
         for b in (b_add_t, b_del_t):
@@ -3049,7 +3063,10 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
     def _refresh_lists(self):
         self.lb_lists.delete(0, "end")
         lists = self._lists_dict()
-        by_name = sorted([(lid, lists[lid]["name"]) for lid in lists], key=lambda x: x[1].lower())
+        by_name = sorted(
+            [(lid, lists[lid].get("name", "")) for lid in lists],
+            key=lambda pair: "".join(ch for ch in unicodedata.normalize("NFKD", pair[1]).casefold() if not unicodedata.combining(ch)).replace("ё", "е"),
+        )
         self._lists_sorted = by_name
         for _, name in by_name:
             self.lb_lists.insert("end", name)
@@ -3130,26 +3147,61 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
         lid = self._sel_list_id()
         if not lid:
             return
-        terms = self._lists_dict().get(lid, {}).get("terms", [])
+
+        terms = list(self._lists_dict().get(lid, {}).get("terms", []))
+
+        # Sort A→Z, case/diacritics insensitive, and normalize "ё"→"е"
+        terms.sort(key=lambda s: "".join(
+            ch for ch in unicodedata.normalize("NFKD", str(s or "")).casefold()
+            if not unicodedata.combining(ch)
+        ).replace("ё", "е"))
+
         for t in terms:
             self.lb_terms.insert("end", t)
 
-    def _add_term(self):
+    def _add_term(self, event=None):  # ← event is optional; buttons still call it without args
         lid = self._sel_list_id()
         if not lid:
-            messagebox.showinfo("Info", "Select a list first.")
             return
         term = self.term_entry.get().strip()
         if not term:
             return
+
         arr = self._lists_dict().setdefault(lid, {}).setdefault("terms", [])
+
         if any(t.strip().lower() == term.lower() for t in arr):
             messagebox.showinfo("Info", "This term already exists in the list.")
-            return
+            # keep focus in the entry for quick editing
+            self.term_entry.focus_set()
+            # prevent default key event propagation when called via Enter
+            return "break"
+
         arr.append(term)
+
+        # keep underlying list sorted (same sorter you already use in _refresh_terms)
+        import unicodedata
+        arr.sort(key=lambda s: "".join(
+            ch for ch in unicodedata.normalize("NFKD", str(s or "")).casefold()
+            if not unicodedata.combining(ch)
+        ).replace("ё", "е"))
+
         self.term_entry.delete(0, "end")
+        self.term_entry.focus_set()
+
         save_glossary_lists()
         self._refresh_terms()
+
+        # Select and make visible the just-added term
+        try:
+            idx = next(i for i, t in enumerate(arr) if t == term)
+            self.lb_terms.selection_clear(0, "end")
+            self.lb_terms.selection_set(idx)
+            self.lb_terms.see(idx)
+        except Exception:
+            pass
+
+        # stop default handling of the Return key when invoked via binding
+        return "break"
 
     def _remove_term(self):
         lid = self._sel_list_id()
@@ -3160,7 +3212,12 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
             return
         term = self.lb_terms.get(sel[0])
         arr = self._lists_dict().get(lid, {}).get("terms", [])
-        self._lists_dict()[lid]["terms"] = [t for t in arr if t != term]
+        new_terms = [t for t in arr if t != term]
+        new_terms.sort(key=lambda s: "".join(
+            ch for ch in unicodedata.normalize("NFKD", str(s or "")).casefold()
+            if not unicodedata.combining(ch)
+        ).replace("ё", "е"))
+        self._lists_dict()[lid]["terms"] = new_terms
         save_glossary_lists()
         self._refresh_terms()
 
