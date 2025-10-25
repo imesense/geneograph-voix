@@ -1492,9 +1492,10 @@ class SpeechSheetApp:
         self.sheet.enable_bindings(("single_select","row_select","column_select","arrowkeys","edit_cell",
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
                                     "copy","cut","paste","delete","undo","double_click_column_resize",
-                                    "double_click_row_resize","rc_delete_column",
-                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"))
+                                    "double_click_row_resize","rc_delete_column","rc_insert_column",
+                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop","edit_header"))
 
+        self._bind_sheet_events()
         root.grid_rowconfigure(2, weight=1)
         root.grid_columnconfigure(0, weight=1)
 
@@ -1545,6 +1546,32 @@ class SpeechSheetApp:
             print("Device log error:", _e)
 
     # ------- Template helpers -------
+    def _bind_sheet_events(self):
+        """Attach tksheet event handlers once per sheet instance."""
+        try:
+            self.sheet.extra_bindings(bindings={
+                "end_edit_header": self._on_end_edit_header,
+                # Optional: keep order persisted when user drags columns
+                "column_drag_and_drop": lambda e: self._persist_column_order_to_template(),
+            })
+        except Exception as e:
+            print("extra_bindings attach error:", e)
+
+    def _on_end_edit_header(self, event=None):
+        """
+        Called after a column header edit in tksheet. Persist headers + order to template,
+        preserving UIDs and existing mappings.
+        """
+        try:
+            self._persist_column_order_to_template()
+            # Keep our in-memory header cache in sync with the widget
+            self.headers = self._current_headers_list()
+            # Small visual hint
+            self._flash_preview_note("✅ Column header saved", ms=900)
+        except Exception as e:
+            print("end_edit_header persist error:", e)
+
+
     def _rebuild_sheet(self, new_headers: list[str], data: list[list[str]]):
         with self.preserve_column_widths():
             try:
@@ -1558,9 +1585,10 @@ class SpeechSheetApp:
                 "single_select","row_select","column_select","arrowkeys","edit_cell",
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
                                     "copy","cut","paste","delete","undo","double_click_column_resize",
-                                    "double_click_row_resize","rc_delete_column",
-                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"
+                                    "double_click_row_resize","rc_delete_column","rc_insert_column",
+                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop","edit_header"
             ))
+            self._bind_sheet_events()
             self._try_style()
             self.sheet.set_sheet_data(data)
             self.load_column_widths()
@@ -1627,8 +1655,9 @@ class SpeechSheetApp:
         self.sheet.enable_bindings(("single_select","row_select","column_select","arrowkeys","edit_cell",
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
                                     "copy","cut","paste","delete","undo","double_click_column_resize",
-                                    "double_click_row_resize","rc_delete_column",
-                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"))
+                                    "double_click_row_resize","rc_delete_column","rc_insert_column",
+                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop","edit_header"))
+        self._bind_sheet_events()
         self._try_style()
         # Load data for the new template
         self.load_data()
@@ -1656,24 +1685,62 @@ class SpeechSheetApp:
         return list(self.headers)
 
     def _persist_column_order_to_template(self):
-        """Record current visible column order back into templates.json."""
+        """Persist current sheet header texts and column order back to the active template,
+        preserving UIDs and mappings even after renames."""
         if not self.active_template:
             return
+
+        # What the user currently sees in the grid (order + new names)
         hdrs = self._current_headers_list()
+
+        # Reload templates.json so we don't overwrite someone else's changes
         self._reload_templates_cache()
+
         for t in self._templates_cache.get("templates", []):
-            if t.get("id") == self.active_template.get("id"):
-                existing_cols = t.get("columns", [])
-                by_header = {c["header"]: c for c in existing_cols}
-                new_cols = []
-                for h in hdrs:
-                    col = by_header.get(h)
-                    if col is None:  # column exists in the sheet but not in template yet
+            if t.get("id") != self.active_template.get("id"):
+                continue
+
+            old_cols = list(t.get("columns", []))  # [{'uid', 'header'}, ...]
+            used_idx = set()
+
+            def take_by_header(h):
+                for i, col in enumerate(old_cols):
+                    if i in used_idx:
+                        continue
+                    if str(col.get("header", "")) == h:
+                        used_idx.add(i)
+                        return dict(col)  # copy
+                return None
+
+            def take_by_pos(pos):
+                if 0 <= pos < len(old_cols) and pos not in used_idx:
+                    used_idx.add(pos)
+                    return dict(old_cols[pos])  # copy
+                return None
+
+            new_cols = []
+            for pos, h in enumerate(hdrs):
+                col = take_by_header(h)
+                if col is None:
+                    # If header text changed (rename), keep the same UID by position
+                    col = take_by_pos(pos)
+                    if col is None:
+                        # Truly a new column that wasn't in template yet
                         col = {"uid": _new_uuid(), "header": h}
-                    new_cols.append(col)
-                t["columns"] = new_cols
-                break
+                    else:
+                        col["header"] = h  # update name
+                else:
+                    # Found by header; still make sure header text is exact
+                    col["header"] = h
+                new_cols.append(col)
+
+            t["columns"] = new_cols
+            break
+
         _write_templates_file(self._templates_cache)
+        # Refresh our live copy
+        self.active_template = _active_template_record()
+
 
     def _active_mapping(self) -> dict:
         return self.active_template.get("mapping", {}) if self.active_template else {}
@@ -1854,9 +1921,10 @@ class SpeechSheetApp:
             "single_select","row_select","column_select","arrowkeys","edit_cell",
                                     "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
                                     "copy","cut","paste","delete","undo","double_click_column_resize",
-                                    "double_click_row_resize","rc_delete_column",
-                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop"
+                                    "double_click_row_resize","rc_delete_column","rc_insert_column",
+                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop","edit_header"
         ))
+        self._bind_sheet_events()
         self.sheet.set_sheet_data(data)
         self._try_style()
 
@@ -1959,16 +2027,20 @@ class SpeechSheetApp:
         else:
             self.sheet.set_cell_data(row, col, processed)
 
+
     def open_glossary_editor(self):
-        def _on_glossary_saved():
-            # 1) reload lists (glossaries.json)
-            load_glossary_lists()
-            # 2) reload template (to see fresh mapping)
+        # Persist + reload so the editor shows fresh header names
+        try:
+            self._persist_column_order_to_template()
             self._reload_active_template_from_disk()
-            # 3) clear caches so new lists/mapping take effect immediately
+        except Exception as e:
+            print("open_glossary sync warn:", e)
+
+        def _on_glossary_saved():
+            load_glossary_lists()
+            self._reload_active_template_from_disk()
             _clear_best_caches()
             GLOSSARIES.clear()
-            # small UX hint
             self._flash_preview_note("📚 Glossary & mapping reloaded", ms=1200)
 
         win = GlossaryListsAndMappingDialog(
@@ -2203,6 +2275,13 @@ class SpeechSheetApp:
             self._settings_applying = False
 
     def open_settings(self):
+        # Make sure latest headers are persisted & reloaded
+        try:
+            self._persist_column_order_to_template()
+            self._reload_active_template_from_disk()
+        except Exception as e:
+            print("open_settings sync warn:", e)
+
         SettingsDialog(
             self.root,
             initial=self._current_settings(),
@@ -3317,7 +3396,7 @@ class SettingsDialog(tk.Toplevel):
             names = [h for (u, h) in cols if u in pending]
             return ", ".join(names) if names else "— none —"
 
-        lab(frm, "Date columns").grid(row=14, column=0, sticky="w", pady=(10,4))
+        lab(frm, "Apply Date formatting to columns").grid(row=14, column=0, sticky="w", pady=(10,4))
         self._date_cols_info = tk.Label(frm, text=_fmt_date_cols_info(), bg=c["bg"], fg=c["muted"])
 
         def _open_date_columns_dialog():
