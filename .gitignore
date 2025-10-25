@@ -17,7 +17,6 @@ dist/
 *.user
 
 # Assets
-assets/
 src/geneograph_voix/runtime_cache/
 src/geneograph_voix/torch_cache/
 

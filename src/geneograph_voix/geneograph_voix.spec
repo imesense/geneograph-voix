@@ -8,7 +8,8 @@ SPEC_DIR   = os.path.abspath(os.getcwd())         # spec is run from its own fol
 APP_DIR    = SPEC_DIR                              # main.py sits beside this spec
 RTHOOKS_DIR= os.path.join(APP_DIR, "rthooks")      # <-- your custom runtime hooks
 ASSETS_DIR = os.path.join(APP_DIR, "assets")
-ICO_PATH   = os.path.join(ASSETS_DIR, "app.ico")
+ICO_PATH    = os.path.join(ASSETS_DIR, "app.ico")
+PNG_PATH    = os.path.join(ASSETS_DIR, "app_256.png") 
 
 # Collect libs / data we need
 hiddenimports  = []
@@ -31,11 +32,11 @@ datas += collect_data_files('tksheet', include_py_files=False)
 datas += collect_data_files('hf_xet', include_py_files=True)
 datas += collect_data_files('pyxet', include_py_files=True)
 
-# Ship default JSONs if you have them locally
-for fname in ('glossary.json', 'settings.json'):
-    fpath = os.path.join(APP_DIR, fname)
-    if os.path.exists(fpath):
-        datas.append((fpath, '.'))
+# --- IMPORTANT: ship icon files for Tk window icon at runtime ---
+if os.path.exists(ICO_PATH):
+    datas.append((ICO_PATH, '.'))     # place at dist root as "app.ico"
+if os.path.exists(PNG_PATH):
+    datas.append((PNG_PATH, '.'))     # place at dist root as "app_256.png"
 
 block_cipher = None
 
@@ -65,7 +66,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=True,  # keep console for logs; set False to hide
-    icon=ICO_PATH if os.path.exists(ICO_PATH) else None,
+    icon=ICO_PATH,
 )
 
 coll = COLLECT(

@@ -1229,6 +1229,40 @@ def _gfm_palette(dark=True):
             "index_fg": "#334155",
         }
 
+
+# ---------- App icon helpers ----------
+APP_ICON_ICO = "app.ico"        # put the same .ico you use with PyInstaller here
+APP_ICON_PNG = "app_256.png"    # optional: for non-Windows, a PNG works best
+
+def _resource_path(name: str) -> str:
+    """Return an absolute path to a resource, working in dev and PyInstaller one-file."""
+    try:
+        base = getattr(sys, "_MEIPASS", None)  # PyInstaller temp dir
+        if base:
+            return os.path.join(base, name)
+    except Exception:
+        pass
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+def _set_app_icon(root: "tk.Tk"):
+    """Set the app/window icon robustly across platforms/bundles."""
+    try:
+        if sys.platform.startswith("win"):
+            ico = _resource_path(APP_ICON_ICO)
+            if os.path.exists(ico):
+                # Titlebar + task switcher icon on Windows
+                root.iconbitmap(ico)
+        else:
+            png = _resource_path(APP_ICON_PNG)
+            if os.path.exists(png):
+                # Apply to all toplevels created after this call
+                img = tk.PhotoImage(file=png)
+                root.iconphoto(True, img)
+                # Prevent image from being garbage-collected
+                root._app_icon_img = img
+    except Exception as e:
+        print("icon set warn:", e)
+
 def _set_windows_dpi_awareness():
     try:
         import ctypes
@@ -4107,6 +4141,7 @@ if __name__ == "__main__":
 
     root = tk.Tk()
     try:
+        _set_app_icon(root)
         enable_crisp_dark_mode(root, dark=True, delay_ms=350)
     except Exception:
         pass
