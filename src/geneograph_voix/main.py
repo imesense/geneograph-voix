@@ -116,8 +116,6 @@ COMMIT_MIN_SILENCE_SEC  = 0.50
 def _preview_tail_sec() -> float:
     return PREVIEW_TAIL_SEC_SPEED if SPEED_MODE else PREVIEW_TAIL_SEC_DEFAULT
 
-APPEND_MODE = False  # Append mode (append instead of replace on commit)
-
 # Autosave
 AUTOSAVE_EVERY_MS = 5 * 60 * 1000   # 5 minutes
 
@@ -141,6 +139,19 @@ MALE_EXCEPTIONS = {
     "калина","лука","осия","оссия","папа","фока","фома","никита",
     "савва","илья","кузьма","мина","сила",
 }
+
+
+SHEET_BINDS = (
+    "single_select","row_select","column_select","arrowkeys","edit_cell",
+    "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
+    "copy","cut","paste","delete","undo",
+    "double_click_column_resize","double_click_row_resize",
+    "rc_delete_column","rc_insert_column","rc_insert_row","rc_delete_row",
+    "find","sort_columns","sort_rows","replace",
+    "column_drag_and_drop","row_drag_and_drop","edit_header"
+)
+
+
 
 # ---------------------------
 # Dynamic VAD strictness (1..5)
@@ -271,7 +282,7 @@ def _read_settings_from_file() -> dict:
     return {}
 
 def _apply_settings_to_globals(s: dict):
-    global LANGUAGE, AUTOSAVE_EVERY_MS, UI_SCALE, MODEL_KEY, SPEED_MODE, VAD_STRICTNESS, GLOSSARY_STRICTNESS, APPEND_MODE
+    global LANGUAGE, AUTOSAVE_EVERY_MS, UI_SCALE, MODEL_KEY, SPEED_MODE, VAD_STRICTNESS, GLOSSARY_STRICTNESS
     try:
         if "language" in s and isinstance(s["language"], str):
             LANGUAGE = s["language"].strip() or "auto"
@@ -296,8 +307,6 @@ def _apply_settings_to_globals(s: dict):
                 globals()["GLOSSARY_STRICTNESS"] = max(1, min(5, lvl))
             except Exception:
                 pass
-        if "append_mode" in s:
-            APPEND_MODE = bool(s["append_mode"])
     except Exception as e:
         print("settings apply error:", e)
 
@@ -1489,11 +1498,7 @@ class SpeechSheetApp:
             print("initial load_column_widths error:", e)
 
         self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
-        self.sheet.enable_bindings(("single_select","row_select","column_select","arrowkeys","edit_cell",
-                                    "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
-                                    "copy","cut","paste","delete","undo","double_click_column_resize",
-                                    "double_click_row_resize","rc_delete_column","rc_insert_column",
-                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop","edit_header"))
+        self._attach_sheet_bindings_safely()
 
         self._bind_sheet_events()
         root.grid_rowconfigure(2, weight=1)
@@ -1547,15 +1552,68 @@ class SpeechSheetApp:
 
     # ------- Template helpers -------
     def _bind_sheet_events(self):
-        """Attach tksheet event handlers once per sheet instance."""
+        """Attach tksheet event handlers once per sheet instance, using tuple-form only."""
+        def _end_edit_header_cb(*_a, **_k):
+            try:
+                self._on_end_edit_header()
+            except Exception as e:
+                print("end_edit_header cb error:", e)
+
+        def _column_dnd_cb(*_a, **_k):
+            try:
+                self._persist_column_order_to_template()
+            except Exception as e:
+                print("column_drag_and_drop cb error:", e)
+
+        def _attach_one(name, cb):
+            try:
+                # Only the canonical list-of-tuples shape; no kwargs, no dict.
+                self.sheet.extra_bindings([(name, cb)])
+                return True
+            except Exception as e:
+                print(f"extra_bindings attach error for '{name}':", repr(e))
+                return False
+
+        def _attach_all():
+            # 1) Header edit finished
+            _attach_one("end_edit_header", _end_edit_header_cb)
+
+            # 2) Column drag-and-drop (different names across tksheet builds)
+            if not _attach_one("column_drag_and_drop", _column_dnd_cb):
+                _attach_one("drag_and_drop", _column_dnd_cb)  # fallback alias
+
+        # Defer until widget is realized; avoids attach timing errors.
         try:
-            self.sheet.extra_bindings(bindings={
-                "end_edit_header": self._on_end_edit_header,
-                # Optional: keep order persisted when user drags columns
-                "column_drag_and_drop": lambda e: self._persist_column_order_to_template(),
-            })
+            self.sheet.after_idle(_attach_all)
+        except Exception:
+            self.sheet.after(0, _attach_all)
+
+    def _attach_sheet_bindings_safely(self):
+        """Enable base tksheet bindings after the widget is realized; supports both iterable and varargs APIs."""
+        def _do():
+            try:
+                self.sheet.enable_bindings(SHEET_BINDS)     # most builds accept iterable
+            except TypeError:
+                self.sheet.enable_bindings(*SHEET_BINDS)    # some builds require varargs
+            except Exception as e:
+                print("enable_bindings warning:", e)
+        try:
+            self.sheet.after(0, _do)
         except Exception as e:
-            print("extra_bindings attach error:", e)
+            print("after(0) attach error:", e)
+            _do()
+
+    def _destroy_sheet_safely(self):
+        """Disable bindings before destroying to avoid stale extra bindings."""
+        try:
+            # Best effort: stop tksheet from keeping extra bindings alive
+            self.sheet.disable_bindings()
+        except Exception:
+            pass
+        try:
+            self.sheet.destroy()
+        except Exception:
+            pass
 
     def _on_end_edit_header(self, event=None):
         """
@@ -1574,19 +1632,13 @@ class SpeechSheetApp:
     def _rebuild_sheet(self, new_headers: list[str], data: list[list[str]]):
         with self.preserve_column_widths():
             try:
-                self.sheet.destroy()
+                self._destroy_sheet_safely()
             except Exception:
                 pass
             self.headers = list(new_headers)
             self.sheet = Sheet(self.root, headers=self.headers, height=400, width=1000, zoom=TABLE_ZOOM_PCT)
             self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
-            self.sheet.enable_bindings((
-                "single_select","row_select","column_select","arrowkeys","edit_cell",
-                                    "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
-                                    "copy","cut","paste","delete","undo","double_click_column_resize",
-                                    "double_click_row_resize","rc_delete_column","rc_insert_column",
-                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop","edit_header"
-            ))
+            self._attach_sheet_bindings_safely()
             self._bind_sheet_events()
             self._try_style()
             self.sheet.set_sheet_data(data)
@@ -1643,19 +1695,13 @@ class SpeechSheetApp:
             return
         self.active_template = t
         self.headers = [col["header"] for col in t["columns"]]
-        # Recreate sheet with new headers but keep row count
-        data = self._get_sheet_data_copy()
         try:
-            self.sheet.destroy()
+            self._destroy_sheet_safely()
         except Exception:
             pass
         self.sheet = Sheet(self.root, headers=self.headers, height=400, width=1000, zoom=TABLE_ZOOM_PCT)
         self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
-        self.sheet.enable_bindings(("single_select","row_select","column_select","arrowkeys","edit_cell",
-                                    "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
-                                    "copy","cut","paste","delete","undo","double_click_column_resize",
-                                    "double_click_row_resize","rc_delete_column","rc_insert_column",
-                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop","edit_header"))
+        self._attach_sheet_bindings_safely()
         self._bind_sheet_events()
         self._try_style()
         # Load data for the new template
@@ -1928,13 +1974,7 @@ class SpeechSheetApp:
 
         self.sheet = Sheet(self.root, headers=self.headers, height=400, width=1000, zoom=TABLE_ZOOM_PCT)
         self.sheet.grid(row=2, column=0, sticky="nsew", padx=10, pady=10)
-        self.sheet.enable_bindings((
-            "single_select","row_select","column_select","arrowkeys","edit_cell",
-                                    "rc_popup_menu","drag_select","column_width_resize","row_height_resize",
-                                    "copy","cut","paste","delete","undo","double_click_column_resize",
-                                    "double_click_row_resize","rc_delete_column","rc_insert_column",
-                                    "rc_insert_row","rc_delete_row","find","sort_columns","sort_rows","replace","column_drag_and_drop","row_drag_and_drop","edit_header"
-        ))
+        self._attach_sheet_bindings_safely()
         self._bind_sheet_events()
         self.sheet.set_sheet_data(data)
         self._try_style()
@@ -2203,8 +2243,7 @@ class SpeechSheetApp:
             "model_key": MODEL_KEY or _pick_default_model_key(),
             "speed_mode": SPEED_MODE,
             "vad_strictness": VAD_STRICTNESS,
-            "glossary_strictness": GLOSSARY_STRICTNESS,
-            "append_mode": APPEND_MODE,
+            "glossary_strictness": GLOSSARY_STRICTNESS
         }
 
     def _refresh_preview_font(self):
@@ -3223,13 +3262,47 @@ class TemplateManagerDialog(tk.Toplevel):
         tid = self._sel_template_id()
         if not tid:
             return
+
+        # prevent deleting the current template
         if data.get("last_template_id") == tid:
-            messagebox.showwarning("Delete", "You cannot delete the currently open template. Open a different one first.")
+            messagebox.showwarning(
+                "Delete",
+                "You cannot delete the currently open template. Open a different one first."
+            )
             return
-        if not messagebox.askyesno("Confirm", "Delete the selected template (structure only)?\nData file will remain on disk."):
+
+        # first confirmation: remove the template entry
+        if not messagebox.askyesno(
+            "Delete template",
+            "Delete the selected template from the list?\n"
+            "(You can choose to delete its data file on disk next.)"
+        ):
             return
+
+        # remove the template record from templates.json
         data["templates"] = [t for t in data.get("templates", []) if t.get("id") != tid]
         _write_templates_file(data)
+
+        # optional second step: also delete the dataset file
+        path = _data_path_for_template(tid)
+        if os.path.exists(path):
+            if messagebox.askyesno(
+                "Delete data file",
+                f"Also delete the dataset file on disk?\n\n{path}"
+            ):
+                try:
+                    try:
+                        from send2trash import send2trash  # optional, safer on all OSes
+                    except Exception:
+                        send2trash = None
+
+                    if send2trash:
+                        send2trash(path)
+                    else:
+                        os.remove(path)
+                except Exception as e:
+                    messagebox.showerror("Delete data file", f"Failed to delete:\n{e}")
+
         self._reload()
 
     def _import_template(self):
