@@ -318,12 +318,19 @@ def _apply_settings_to_globals(s: dict):
 
 def _save_settings_file(s: dict):
     try:
+        # Merge with existing settings so geometry & other runtime keys survive
+        old = _read_settings_from_file()
+        if not isinstance(old, dict):
+            old = {}
+        old.update(s)
+
         tmp = os.path.join(os.path.dirname(SETTINGS_FILE) or ".", "~settings.tmp.json")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(s, f, ensure_ascii=False, indent=2)
+            json.dump(old, f, ensure_ascii=False, indent=2)
         os.replace(tmp, SETTINGS_FILE)
     except Exception as e:
         print("settings save error:", e)
+
 
 # =========================================
 # Templates & Global Glossary lists
@@ -410,8 +417,7 @@ def load_glossary_lists():
 def save_glossary_lists():
     obj = GLOSSARY_LISTS if isinstance(GLOSSARY_LISTS, dict) else {"lists": {}}
     lists = obj.get("lists", {})
-
-    import unicodedata
+    
     def _key(name: str) -> str:
         t = unicodedata.normalize("NFKD", str(name or "")).casefold()
         t = "".join(ch for ch in t if not unicodedata.combining(ch))
@@ -835,7 +841,6 @@ _WDL_DEL_COST   = 1.0
 _WDL_SWAP_COST  = 0.8
 _WDL_CONF_COST  = 0.55
 _WDL_VOWEL_COST = 0.70
-_WDL_NEAR_COST  = 0.65
 _WDL_BASE_COST  = 1.0
 
 _SPECIAL_PAIRS = {
@@ -1042,8 +1047,13 @@ def _should_correct_from_norm(a_norm: str, best: Optional[_Best], runner_up: Opt
     if dice >= min_d and anchor >= req_anchor:
         return True
 
+
     if runner_up is None:
-        return (anchor >= req_anchor) or (GLOSSARY_STRICTNESS >= 4 and sk_len >= 3 and sk_dice >= 0.80 and wdl <= (max_ed + 0.2))
+        # Levels 1–3: no correction if it failed the main (dice+anchor) gate above.
+        if GLOSSARY_STRICTNESS <= 3:
+            return False
+        # Levels 4–5: keep the original permissive fallback.
+        return (anchor >= req_anchor) or (sk_len >= 3 and sk_dice >= 0.80 and wdl <= (max_ed + 0.2))
 
     score_best, _, _, _ = _combined_score(a_norm, best.norm)
     score_run , _, _, _ = _combined_score(a_norm, runner_up.norm)
@@ -1469,6 +1479,102 @@ def enable_crisp_dark_mode(root: "tk.Tk", dark=True, delay_ms=350):
         _apply_dark_ui(root, dark=dark)
 
 # --- UI Helpers - High-DPI fitting + main window size restore ---
+def _parse_geometry(geom: str):
+    try:
+        m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", str(geom))
+        if not m:
+            return None
+        return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+    except Exception:
+        return None
+
+def _get_workarea_bounds(root):
+    """
+    Return work-area bounds in **Tk units**: (work_w, work_h, work_x, work_y).
+    On Windows we query the monitor work area in physical pixels and convert
+    to Tk units using a per-monitor ratio derived from rcMonitor vs Tk's screen size.
+    """
+    # Non-Windows: fall back to Tk's screen size
+    if not sys.platform.startswith("win"):
+        try:
+            return root.winfo_screenwidth(), root.winfo_screenheight(), 0, 0
+        except Exception:
+            return 1920, 1080, 0, 0
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+
+        # Structures
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                        ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_ulong),
+                        ("rcMonitor", RECT),
+                        ("rcWork", RECT),
+                        ("dwFlags", ctypes.c_ulong)]
+
+        MONITOR_DEFAULTTONEAREST = 0x00000002
+
+        hwnd = root.winfo_id()
+        hmon = user32.MonitorFromWindow(ctypes.wintypes.HWND(hwnd), MONITOR_DEFAULTTONEAREST)
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        user32.GetMonitorInfoW(hmon, ctypes.byref(mi))
+
+        # Physical pixel rectangles
+        rcM = mi.rcMonitor
+        rcW = mi.rcWork
+        mon_w = rcM.right - rcM.left
+        mon_h = rcM.bottom - rcM.top
+        work_w_px = rcW.right - rcW.left
+        work_h_px = rcW.bottom - rcW.top
+
+        # Tk reports its own screen width/height in Tk units (scaled)
+        tk_sw = max(1, int(root.winfo_screenwidth()))
+        tk_sh = max(1, int(root.winfo_screenheight()))
+
+        # Convert physical → Tk units via per-axis ratios
+        # (Works for per-monitor DPI; we only clamp against the monitor the window is on.)
+        ratio_x = tk_sw / float(mon_w) if mon_w > 0 else 1.0
+        ratio_y = tk_sh / float(mon_h) if mon_h > 0 else 1.0
+
+        work_w = int(round(work_w_px * ratio_x))
+        work_h = int(round(work_h_px * ratio_y))
+        work_x = int(round(rcW.left * ratio_x))
+        work_y = int(round(rcW.top * ratio_y))
+
+        # Guard rails
+        work_w = max(320, min(work_w, tk_sw))
+        work_h = max(240, min(work_h, tk_sh))
+
+        return work_w, work_h, work_x, work_y
+    except Exception:
+        # Fallback if anything fails
+        try:
+            return root.winfo_screenwidth(), root.winfo_screenheight(), 0, 0
+        except Exception:
+            return 1920, 1080, 0, 0
+
+def _fit_to_screen_bounds(root, w, h, x, y):
+    """
+    Clamp a geometry (in Tk units) to the current monitor work area (also in Tk units).
+    """
+    work_w, work_h, work_x, work_y = _get_workarea_bounds(root)
+    min_w, min_h = 640, 480
+
+    w = max(min_w, min(w, work_w))
+    h = max(min_h, min(h, work_h))
+
+    # Keep the window fully inside work area
+    x = max(work_x, min(x, work_x + work_w - w))
+    y = max(work_y, min(y, work_y + work_h - h))
+    return w, h, x, y
+
 
 def _fit_to_screen(win: "tk.Tk", margin: int = 60):
     """
@@ -1499,30 +1605,6 @@ def _fit_to_screen(win: "tk.Tk", margin: int = 60):
     except Exception:
         pass
 
-
-def _restore_main_window_geometry(root: "tk.Tk", s: dict):
-    """
-    Apply saved main window size or a sensible default based on screen size.
-    Call this after creating Tk() and before building widgets.
-    """
-    try:
-        root.update_idletasks()
-        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-        mw = (s or {}).get("main_window", {}) if isinstance(s, dict) else {}
-        w = int(mw.get("width", 0) or 0)
-        h = int(mw.get("height", 0) or 0)
-        if w <= 0 or h <= 0:
-            # first run / nothing saved — pick a nice default
-            w = min(int(sw * 0.85), 1400)
-            h = min(int(sh * 0.85), 900)
-        root.geometry(f"{w}x{h}")
-        try:
-            root.minsize(900, 600)
-        except Exception:
-            pass
-        _fit_to_screen(root, margin=60)
-    except Exception:
-        pass
 
 
 # ===========================
@@ -1645,6 +1727,8 @@ class SpeechSheetApp:
 
         self._style_action_buttons()
         self.root.after(600, self._style_action_buttons)
+        self._bind_geometry_persistence()
+        self._restore_main_window_geometry()
 
         # Status bar (bottom)
         status_colors = _gfm_palette(True)
@@ -1659,9 +1743,6 @@ class SpeechSheetApp:
         )
         self.template_status_label.pack(side="left", fill="x", expand=True)
         self._update_template_status()
-
-        # Fit on first show and remember size for next time
-        self._install_size_persistence()
 
         # Data
         self.load_data()
@@ -1690,44 +1771,107 @@ class SpeechSheetApp:
             print("Device log error:", _e)
 
     # ------- UI helpers -------
-    def _install_size_persistence(self):
-        self._size_save_after = None
-        self._last_saved_wh = None
+    def _restore_main_window_geometry(self):
+        try:
+            s = _read_settings_from_file()
+            geom = s.get("window_geometry")
+            state = s.get("window_state", "normal")
 
-        def _on_cfg(event=None):
-            if event and event.widget is not self.root:
+            # Track what we restored so we can detect user-driven changes later
+            self._geom_restored = None
+
+            if geom:
+                parsed = _parse_geometry(geom)
+                if parsed:
+                    w, h, x, y = parsed
+                    w, h, x, y = _fit_to_screen_bounds(self.root, w, h, x, y)
+                    self.root.geometry(f"{w}x{h}+{x}+{y}")
+                    self._geom_restored = (w, h, x, y)
+
+            self.root.update_idletasks()
+            if state == "zoomed":
+                try:
+                    self.root.state("zoomed")
+                except Exception:
+                    pass
+
+            # NOTE: no unconditional post-restore save here anymore.
+            # We only save later if the user actually resizes/moves the window.
+        except Exception as e:
+            print("restore geometry warn:", e)
+
+    def _save_main_window_geometry(self):
+        try:
+            state = self.root.state()
+            s = _read_settings_from_file()
+            s = dict(s) if isinstance(s, dict) else {}
+
+            # Save state; only persist geometry when in 'normal' state
+            s["window_state"] = state if state in ("zoomed", "normal") else "normal"
+            if s["window_state"] == "normal":
+                s["window_geometry"] = self.root.winfo_geometry()
+
+            _save_settings_file(s)
+        except Exception as e:
+            print("save geometry warn:", e)
+
+    def _bind_geometry_persistence(self):
+        # Defer geometry autosaves until layout has stabilized
+        self._geom_save_job = None
+        self._geom_ready = False
+        self._geom_boot_deadline = time.monotonic() + 1.2  # wait ~1.2s after launch
+        self._last_saved_geom = None
+
+        def _on_cfg(evt=None):
+            # Don’t save while applying settings or before the boot deadline
+            if getattr(self, "_settings_applying", False):
                 return
+            if time.monotonic() < self._geom_boot_deadline or not self._geom_ready:
+                return
+
+            # Only persist in normal state (zoomed/fullscreen produces junk numbers)
             try:
-                w, h = self.root.winfo_width(), self.root.winfo_height()
-                if (w, h) == self._last_saved_wh:
+                if self.root.state() != "normal":
                     return
-                if self._size_save_after:
-                    self.root.after_cancel(self._size_save_after)
-                # debounce saves while the user is dragging
-                self._size_save_after = self.root.after(800, self._save_main_geometry_now)
+            except Exception:
+                return
+
+            # Ignore obviously bogus/early sizes
+            try:
+                w = int(getattr(evt, "width", 0) or 0)
+                h = int(getattr(evt, "height", 0) or 0)
+                if w and h and (w < 400 or h < 300):
+                    return
             except Exception:
                 pass
 
-        # initial fit + bind
-        try:
-            _fit_to_screen(self.root, margin=60)
-        except Exception:
-            pass
-        self.root.bind("<Configure>", _on_cfg, add="+")
+            # Throttle writes
+            if self._geom_save_job:
+                try:
+                    self.root.after_cancel(self._geom_save_job)
+                except Exception:
+                    pass
 
-    def _save_main_geometry_now(self):
-        try:
-            w = max(640, int(self.root.winfo_width()  or 0))
-            h = max(480, int(self.root.winfo_height() or 0))
-            s = _read_settings_from_file()
-            mw = s.get("main_window", {}) if isinstance(s, dict) else {}
-            mw.update({"width": w, "height": h})
-            s["main_window"] = mw
-            _save_settings_file(s)
-            self._last_saved_wh = (w, h)
-            self._size_save_after = None
-        except Exception:
-            pass
+            def _commit():
+                try:
+                    geom = self.root.winfo_geometry()
+                    if geom != self._last_saved_geom:
+                        self._save_main_window_geometry()
+                        self._last_saved_geom = geom
+                except Exception:
+                    pass
+
+            self._geom_save_job = self.root.after(350, _commit)
+
+        # Start listening after first idle so requested sizes are computed
+        def _arm_ready():
+            # mark “ready” a bit after first paint; dark-mode restyle runs at 350ms
+            self._geom_ready = True
+
+        self.root.bind("<Configure>", _on_cfg, add="+")
+        self.root.bind("<Map>", _on_cfg, add="+")
+        self.root.after(700, _arm_ready)
+
 
     # ------- Template helpers -------
     
@@ -2263,7 +2407,7 @@ class SpeechSheetApp:
         except Exception:
             pass
 
-        try: _fit_to_screen(self, margin=60)
+        try: _fit_to_screen(win, margin=60)
         except Exception: 
             pass
 
@@ -3046,6 +3190,7 @@ class SpeechSheetApp:
             self._persist_column_order_to_template()
             self.save_data()
             self.save_column_widths()
+            self._save_main_window_geometry()
         finally:
             try:
                 self._detach_console_if_any()
@@ -3525,13 +3670,10 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
         try:
             self._commit_mapping_to_disk()
             self.on_saved()
-            # persist window size on close too
-            try: 
-                self._save_main_geometry_now()
-            except Exception: pass
-
         finally:
             self.destroy()
+
+
 
 # ===========================
 # Template Manager Dialog
@@ -4369,6 +4511,7 @@ if __name__ == "__main__":
     _warmup_model()
 
     _boost_process_priority_windows()
+    _set_windows_dpi_awareness()
     root = tk.Tk()
 
     try:
@@ -4376,10 +4519,9 @@ if __name__ == "__main__":
         enable_crisp_dark_mode(root, dark=True, delay_ms=350)
     except Exception:
         pass
-    try: _fit_to_screen(self, margin=60)
+    try: _fit_to_screen(root, margin=60)
     except Exception: 
         pass
 
-    _restore_main_window_geometry(root, s)
     app = SpeechSheetApp(root)
     root.mainloop()
