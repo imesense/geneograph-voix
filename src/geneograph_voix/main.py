@@ -3800,8 +3800,57 @@ class SettingsDialog(tk.Toplevel):
 
         c = _gfm_palette(True)
         self.configure(bg=c["bg"])
-        frm = tk.Frame(self, bg=c["bg"])
-        frm.pack(fill="both", expand=True, padx=14, pady=12)
+
+        # --- Scrollable content area (keeps bottom buttons visible) ---
+        outer = tk.Frame(self, bg=c["bg"])
+        outer.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(outer, bg=c["bg"], highlightthickness=0)
+        vbar   = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+
+        vbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        # holder gives visual margins; frm is your existing grid container
+        holder = tk.Frame(canvas, bg=c["bg"])
+        frm    = tk.Frame(holder, bg=c["bg"])
+        frm.pack(fill="both", expand=True, padx=14, pady=12)  # <<< consistent margins
+
+        _win_id = canvas.create_window((0, 0), window=holder, anchor="nw")
+
+        def _on_cfg(_=None):
+            try:
+                holder.update_idletasks()
+                bbox = canvas.bbox(_win_id)
+                if bbox:
+                    canvas.configure(scrollregion=bbox)
+                # keep inner width equal to canvas width (so the scrollbar sits to the side)
+                canvas.itemconfigure(_win_id, width=canvas.winfo_width())
+            except Exception:
+                pass
+
+        holder.bind("<Configure>", _on_cfg)
+        canvas.bind("<Configure>", _on_cfg)
+
+        # Smooth mouse wheel scrolling
+        def _bind_wheel(w):
+            def _on_mousewheel(e):
+                try:
+                    if getattr(e, "num", None) == 5 or getattr(e, "delta", 0) < 0:
+                        canvas.yview_scroll(1, "units")
+                    elif getattr(e, "num", None) == 4 or getattr(e, "delta", 0) > 0:
+                        canvas.yview_scroll(-1, "units")
+                except Exception:
+                    pass
+                return "break"
+            w.bind_all("<MouseWheel>", _on_mousewheel, add="+")  # Win/macOS
+            w.bind_all("<Button-4>",  _on_mousewheel, add="+")   # X11
+            w.bind_all("<Button-5>",  _on_mousewheel, add="+")
+        _bind_wheel(self)
+
+        # Keep a handle if needed elsewhere
+        self._settings_canvas = canvas
 
         def lab(parent, txt):
             return tk.Label(parent, text=txt, bg=c["bg"], fg=c["text"])
@@ -4061,10 +4110,14 @@ class SettingsDialog(tk.Toplevel):
         b_cancel.pack(side="right")
 
         try:
-            # First pass after building widgets
+            enable_crisp_dark_mode(self, dark=True, delay_ms=0)
+        except Exception:
+            pass
+        # Make sure the window is big enough to show the buttons and initial content,
+        # but not larger than the screen; center it. Do a second pass after a tick.
+        try:
             self.update_idletasks()
             _fit_to_screen(self, margin=60)
-            # Second pass shortly after (fonts/theme/UI scale may change sizes a bit)
             self.after(30, lambda: (_fit_to_screen(self, margin=60)))
         except Exception:
             pass
