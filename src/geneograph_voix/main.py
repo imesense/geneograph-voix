@@ -122,6 +122,9 @@ AUTOSAVE_EVERY_MS = 5 * 60 * 1000   # 5 minutes
 # Columns / cleaning
 NAME_COLUMNS = {"Имя", "Фамилия", "Имя отца", "Имя матери", "Имя Матери"}
 
+# Text normalization
+REMOVE_PUNCT = True  # controlled by Settings: "Remove punctuation"
+
 # Outro ban list
 BAN_PHRASES = tuple(s.lower() for s in (
     "Субтитры сделал DimaTorzok",
@@ -307,6 +310,8 @@ def _apply_settings_to_globals(s: dict):
                 globals()["GLOSSARY_STRICTNESS"] = max(1, min(5, lvl))
             except Exception:
                 pass
+        if "remove_punct" in s:
+            globals()["REMOVE_PUNCT"] = bool(s["remove_punct"])
     except Exception as e:
         print("settings apply error:", e)
 
@@ -601,6 +606,26 @@ def strip_trailing_dot(text: str) -> str:
     while s.endswith(".") or s.endswith("…"):
         s = s[:-1]
     return s
+
+def _remove_punct_keep_hyphen(text: str) -> str:
+    """
+    Remove all punctuation but keep hyphens/dashes. Collapses spaces.
+    Keeps: '-' U+002D, '–' U+2013, '—' U+2014.
+    """
+    if not text:
+        return ""
+    keep = "-–—"
+    out = []
+    for ch in str(text):
+        cat = unicodedata.category(ch)
+        if cat and cat.startswith("P") and ch not in keep:
+            out.append(" ")
+        else:
+            out.append(ch)
+    t = "".join(out)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
 
 # ===========================
 # Decoding functions
@@ -1277,14 +1302,20 @@ def _set_windows_dpi_awareness():
     except Exception:
         pass
 
+# Remember the original Tk scaling so re-applying doesn't multiply it
+_BASE_TK_SCALING = None
+
 def _auto_scaling(root: "tk.Tk"):
+    global _BASE_TK_SCALING
     try:
-        dpi = root.winfo_fpixels('1i')
-        scaling = max(1.0, float(dpi) / 72.0)
-        scaling = min(2.5, scaling * UI_SCALE)
-        root.tk.call('tk', 'scaling', scaling)
+        if _BASE_TK_SCALING is None:
+            # Tk's 'scaling' is pixels-per-point (1pt = 1/72"). Default is usually 1.0.
+            _BASE_TK_SCALING = float(root.tk.call('tk', 'scaling')) or 1.0
+        new_scale = max(0.5, min(2.5, float(_BASE_TK_SCALING) * float(UI_SCALE)))
+        root.tk.call('tk', 'scaling', new_scale)
     except Exception:
         pass
+
 
 def _apply_fonts(root: "tk.Tk"):
     if not tkfont:
@@ -1437,6 +1468,63 @@ def enable_crisp_dark_mode(root: "tk.Tk", dark=True, delay_ms=350):
     except Exception:
         _apply_dark_ui(root, dark=dark)
 
+# --- UI Helpers - High-DPI fitting + main window size restore ---
+
+def _fit_to_screen(win: "tk.Tk", margin: int = 60):
+    """
+    Make the window big enough to show all content (up to screen - margin)
+    and center it. Uses *required* size so bottom buttons aren't cut off.
+    """
+    try:
+        win.update_idletasks()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+
+        # Use the larger of current size and required (natural) size
+        cur_w = win.winfo_width() or 0
+        cur_h = win.winfo_height() or 0
+        req_w = win.winfo_reqwidth() or cur_w or 800
+        req_h = win.winfo_reqheight() or cur_h or 600
+
+        w = max(cur_w, req_w)
+        h = max(cur_h, req_h)
+
+        # Clamp to screen with margin
+        w = max(100, min(int(w), sw - margin))
+        h = max(100, min(int(h), sh - margin))
+
+        # Center
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        win.geometry(f"{w}x{h}+{x}+{y}")
+    except Exception:
+        pass
+
+
+def _restore_main_window_geometry(root: "tk.Tk", s: dict):
+    """
+    Apply saved main window size or a sensible default based on screen size.
+    Call this after creating Tk() and before building widgets.
+    """
+    try:
+        root.update_idletasks()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        mw = (s or {}).get("main_window", {}) if isinstance(s, dict) else {}
+        w = int(mw.get("width", 0) or 0)
+        h = int(mw.get("height", 0) or 0)
+        if w <= 0 or h <= 0:
+            # first run / nothing saved — pick a nice default
+            w = min(int(sw * 0.85), 1400)
+            h = min(int(sh * 0.85), 900)
+        root.geometry(f"{w}x{h}")
+        try:
+            root.minsize(900, 600)
+        except Exception:
+            pass
+        _fit_to_screen(root, margin=60)
+    except Exception:
+        pass
+
+
 # ===========================
 # GUI Application
 # ===========================
@@ -1572,6 +1660,9 @@ class SpeechSheetApp:
         self.template_status_label.pack(side="left", fill="x", expand=True)
         self._update_template_status()
 
+        # Fit on first show and remember size for next time
+        self._install_size_persistence()
+
         # Data
         self.load_data()
 
@@ -1598,7 +1689,48 @@ class SpeechSheetApp:
         except Exception as _e:
             print("Device log error:", _e)
 
+    # ------- UI helpers -------
+    def _install_size_persistence(self):
+        self._size_save_after = None
+        self._last_saved_wh = None
+
+        def _on_cfg(event=None):
+            if event and event.widget is not self.root:
+                return
+            try:
+                w, h = self.root.winfo_width(), self.root.winfo_height()
+                if (w, h) == self._last_saved_wh:
+                    return
+                if self._size_save_after:
+                    self.root.after_cancel(self._size_save_after)
+                # debounce saves while the user is dragging
+                self._size_save_after = self.root.after(800, self._save_main_geometry_now)
+            except Exception:
+                pass
+
+        # initial fit + bind
+        try:
+            _fit_to_screen(self.root, margin=60)
+        except Exception:
+            pass
+        self.root.bind("<Configure>", _on_cfg, add="+")
+
+    def _save_main_geometry_now(self):
+        try:
+            w = max(640, int(self.root.winfo_width()  or 0))
+            h = max(480, int(self.root.winfo_height() or 0))
+            s = _read_settings_from_file()
+            mw = s.get("main_window", {}) if isinstance(s, dict) else {}
+            mw.update({"width": w, "height": h})
+            s["main_window"] = mw
+            _save_settings_file(s)
+            self._last_saved_wh = (w, h)
+            self._size_save_after = None
+        except Exception:
+            pass
+
     # ------- Template helpers -------
+    
     def _bind_sheet_events(self):
         """Attach tksheet event handlers once per sheet instance."""
         try:
@@ -2068,6 +2200,7 @@ class SpeechSheetApp:
 
         # Processed value (date normalization OR glossary correction + optional name cleanup)
         processed = None
+
         if self._is_date_column(col_uid, header_label):
             value = normalize_date(incoming)
             if value is None:
@@ -2076,6 +2209,7 @@ class SpeechSheetApp:
                 self.preview_label.config(text="🎤 Preview: (дата не распознана — повторите)")
                 return
             processed = value
+            
         else:
             # Build synthetic glossary key for caching
             key = f"col:{col_uid or col}"
@@ -2084,6 +2218,8 @@ class SpeechSheetApp:
             if header_label in NAME_COLUMNS:
                 value = clean_person_field(value)
             processed = value
+            if REMOVE_PUNCT:
+                processed = _remove_punct_keep_hyphen(processed)
 
         processed = (processed or "").strip()
         if not processed:
@@ -2125,6 +2261,10 @@ class SpeechSheetApp:
         try:
             enable_crisp_dark_mode(win, dark=True, delay_ms=0)
         except Exception:
+            pass
+
+        try: _fit_to_screen(self, margin=60)
+        except Exception: 
             pass
 
     # Autosave
@@ -2460,7 +2600,8 @@ class SpeechSheetApp:
             "model_key": MODEL_KEY or _pick_default_model_key(),
             "speed_mode": SPEED_MODE,
             "vad_strictness": VAD_STRICTNESS,
-            "glossary_strictness": GLOSSARY_STRICTNESS
+            "glossary_strictness": GLOSSARY_STRICTNESS,
+            "remove_punct": REMOVE_PUNCT
         }
 
     def _refresh_preview_font(self):
@@ -2922,6 +3063,9 @@ class SpeechSheetApp:
         lbl = tk.Label(self._loading, text=text)
         lbl.pack(expand=True, fill="both", padx=20, pady=20)
         try: enable_crisp_dark_mode(self._loading, dark=True, delay_ms=0)
+        except Exception: 
+            pass
+        try: _fit_to_screen(self._loading, margin=120)
         except Exception: pass
         self._loading.update()
 
@@ -3078,6 +3222,9 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
         try:
             enable_crisp_dark_mode(self, dark=True, delay_ms=0)
         except Exception:
+            pass
+        try: _fit_to_screen(self, margin=60)
+        except Exception: 
             pass
 
     # ---------- Utilities ----------
@@ -3378,6 +3525,11 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
         try:
             self._commit_mapping_to_disk()
             self.on_saved()
+            # persist window size on close too
+            try: 
+                self._save_main_geometry_now()
+            except Exception: pass
+
         finally:
             self.destroy()
 
@@ -3429,6 +3581,9 @@ class TemplateManagerDialog(tk.Toplevel):
         try:
             enable_crisp_dark_mode(self, dark=True, delay_ms=0)
         except Exception:
+            pass
+        try: _fit_to_screen(self, margin=60)
+        except Exception: 
             pass
 
     def _reload(self):
@@ -3698,12 +3853,17 @@ class SettingsDialog(tk.Toplevel):
                           bg=c["surface"], fg=c["entry_fg"], insertbackground=c["entry_fg"])
         e_auto.grid(row=5, column=0, sticky="ew", padx=(0,6), pady=(0,10))
 
-        # UI scale
-        lab(frm, "UI Scale (e.g., 1.00, 1.25)").grid(row=6, column=0, sticky="w", pady=(0,4))
-        self.var_scale = tk.StringVar(value=str(initial.get("ui_scale", 1.0)))
-        e_scale = tk.Entry(frm, textvariable=self.var_scale, relief="flat",
-                           bg=c["surface"], fg=c["entry_fg"], insertbackground=c["entry_fg"])
-        e_scale.grid(row=7, column=0, sticky="ew", padx=(0,6), pady=(0,10))
+        # UI scale (0.50 .. 1.50 step 0.25)
+        lab(frm, "UI Scale").grid(row=6, column=0, sticky="w", pady=(0,4))
+        self.var_scale = tk.DoubleVar(value=float(initial.get("ui_scale", 1.0)))
+        self.sld_scale = tk.Scale(
+            frm, from_=0.50, to=1.50, resolution=0.25, orient="horizontal",
+            variable=self.var_scale, bg=c["bg"], fg=c["text"],
+            troughcolor=c["border"], highlightthickness=0, relief="flat",
+            showvalue=True, length=240
+        )
+        self.sld_scale.grid(row=7, column=0, sticky="w", padx=(0,6), pady=(0,10))
+
 
         # VAD strictness
         lab(frm, "VAD Strictness (1 = loose, 5 = strict)").grid(row=8, column=0, sticky="w", pady=(0,4))
@@ -3734,6 +3894,17 @@ class SettingsDialog(tk.Toplevel):
         speed_box.grid(row=12, column=0, sticky="w", pady=(4,10))
 
         frm.grid_columnconfigure(0, weight=1)
+
+        # Remove punctuation (global, non-date columns)
+        self.var_remove_punct = tk.BooleanVar(value=bool(initial.get("remove_punct", True)))
+        rm_box = tk.Checkbutton(
+            frm, text="Remove punctuation (keep hyphens) in non-date columns",
+            variable=self.var_remove_punct, bg=c["bg"], fg=c["text"],
+            activebackground=c["bg"], activeforeground=c["text"],
+            selectcolor=c.get("surface", "#151a21")
+        )
+        rm_box.grid(row=13, column=0, sticky="w", pady=(4,10))
+
 
         # Date columns (per current template)
         def _fmt_date_cols_info():
@@ -3845,15 +4016,10 @@ class SettingsDialog(tk.Toplevel):
             except Exception:
                 messagebox.showerror("Invalid value", "Autosave must be an integer ≥ 1.")
                 return
-
-            try:
-                scale = float(self.var_scale.get())
-                if scale < 0.75 or scale > 2.5:
-                    raise ValueError()
-            except Exception:
-                messagebox.showerror("Invalid value", "UI Scale must be between 0.75 and 2.5.")
-                return
             
+            # UI scale from slider; snap to the 0.25 grid
+            scale = float(self.var_scale.get())
+            scale = max(0.50, min(1.50, round(scale * 4) / 4.0))
 
             model_label = self.var_model_label.get()
             model_key = _LABEL_TO_MODELKEY.get(model_label, _pick_default_model_key())
@@ -3867,6 +4033,7 @@ class SettingsDialog(tk.Toplevel):
                 "vad_strictness": max(1, min(5, int(self.var_vad.get()))),
                 "glossary_strictness": max(1, min(5, int(self.var_gloss.get()))),
                 "append_columns": list(self._append_cols_pending),
+                "remove_punct": bool(self.var_remove_punct.get()),
             }
 
             s["date_columns"] = list(getattr(self, "_date_cols_pending", set()))
@@ -3894,9 +4061,14 @@ class SettingsDialog(tk.Toplevel):
         b_cancel.pack(side="right")
 
         try:
-            enable_crisp_dark_mode(self, dark=True, delay_ms=0)
+            # First pass after building widgets
+            self.update_idletasks()
+            _fit_to_screen(self, margin=60)
+            # Second pass shortly after (fonts/theme/UI scale may change sizes a bit)
+            self.after(30, lambda: (_fit_to_screen(self, margin=60)))
         except Exception:
             pass
+
 
 # ===========================
 # Date column dialog
@@ -4000,6 +4172,9 @@ class DateColumnsDialog(tk.Toplevel):
         try:
             enable_crisp_dark_mode(self, dark=True, delay_ms=0)
         except Exception:
+            pass
+        try: _fit_to_screen(self, margin=60)
+        except Exception: 
             pass
 
 # ===========================
@@ -4108,6 +4283,9 @@ class AppendColumnsDialog(tk.Toplevel):
             enable_crisp_dark_mode(self, dark=True, delay_ms=0)
         except Exception:
             pass
+        try: _fit_to_screen(self, margin=60)
+        except Exception: 
+            pass
 
 # ===========================
 # App entry
@@ -4138,12 +4316,17 @@ if __name__ == "__main__":
     _warmup_model()
 
     _boost_process_priority_windows()
-
     root = tk.Tk()
+
     try:
         _set_app_icon(root)
         enable_crisp_dark_mode(root, dark=True, delay_ms=350)
     except Exception:
         pass
+    try: _fit_to_screen(self, margin=60)
+    except Exception: 
+        pass
+
+    _restore_main_window_geometry(root, s)
     app = SpeechSheetApp(root)
     root.mainloop()

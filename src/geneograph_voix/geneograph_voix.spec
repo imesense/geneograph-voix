@@ -6,8 +6,8 @@ from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules, co
 # Paths (do NOT use __file__ here)
 SPEC_DIR   = os.path.abspath(os.getcwd())         # spec is run from its own folder
 APP_DIR    = SPEC_DIR                              # main.py sits beside this spec
-RTHOOKS_DIR= os.path.join(APP_DIR, "rthooks")      # <-- your custom runtime hooks
-ASSETS_DIR = os.path.join(APP_DIR, "assets")
+RTHOOKS_DIR= os.path.join(APP_DIR, "src/geneograph_voix/rthooks")      # <-- your custom runtime hooks
+ASSETS_DIR = os.path.join(APP_DIR, "src/geneograph_voix/assets")
 ICO_PATH    = os.path.join(ASSETS_DIR, "app.ico")
 PNG_PATH    = os.path.join(ASSETS_DIR, "app_256.png") 
 
