@@ -20,6 +20,9 @@ hiddenimports += collect_submodules('tokenizers')
 # Ensure Xet plugin is bundled
 hiddenimports += ['hf_xet', 'pyxet']
 
+# Explicit hidden imports for dynamic dependencies
+hiddenimports += ['requests']
+
 binaries  = []
 binaries += collect_dynamic_libs('ctranslate2')
 binaries += collect_dynamic_libs('tokenizers')
