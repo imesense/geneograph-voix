@@ -25,6 +25,8 @@ from tkinter import filedialog, messagebox, simpledialog
 from tksheet import Sheet
 from faster_whisper import WhisperModel
 
+from geneograph_voix.Views.Palette import _set_palette
+
 # =========================================
 # Writable caches (helps PyInstaller one-folder)
 # =========================================
@@ -1214,57 +1216,6 @@ except Exception:
     ttk = None
     tkfont = None
 
-def _gfm_palette(dark=True):
-    if dark:
-        return {
-            "bg": "#0f1216",
-            "surface": "#151a21",
-            "elevated": "#1b212a",
-            "text": "#e6e6e6",
-            "muted": "#a8b2bd",
-            "accent": "#479d7b",
-            "grid": "#2b323c",
-            "border": "#2b323c",
-            "entry_bg": "#0f1216",
-            "entry_fg": "#e6e6e6",
-            "sel_bg": "#263a33",
-            "sel_fg": "#eaf5f0",
-            "button_bg": "#222833",
-            "button_active_bg": "#2a3140",
-            "button_fg": "#eef1f4",
-            "button_border": "#333a46",
-            "button_disabled_bg": "#1f2430",
-            "button_disabled_fg": "#717b89",
-            "header_bg": "#151a21",
-            "header_fg": "#d9dee5",
-            "index_bg": "#151a21",
-            "index_fg": "#cbd3dc",
-        }
-    else:
-        return {
-            "bg": "#ffffff",
-            "surface": "#f5f7f9",
-            "elevated": "#ffffff",
-            "text": "#0f141a",
-            "muted": "#5b6876",
-            "accent": "#479d7b",
-            "grid": "#e3e8ef",
-            "border": "#d8dee6",
-            "entry_bg": "#ffffff",
-            "entry_fg": "#0f141a",
-            "sel_bg": "#d8efe6",
-            "sel_fg": "#0f141a",
-            "button_bg": "#e9edf2",
-            "button_active_bg": "#dfe6ee",
-            "button_fg": "#0f141a",
-            "button_border": "#cbd3dc",
-            "header_bg": "#f6f8fa",
-            "header_fg": "#0f141a",
-            "index_bg": "#f6f8fa",
-            "index_fg": "#334155",
-        }
-
-
 # ---------- App icon helpers ----------
 APP_ICON_ICO = "app.ico"        # put the same .ico you use with PyInstaller here
 APP_ICON_PNG = "app_256.png"    # optional: for non-Windows, a PNG works best
@@ -1349,7 +1300,7 @@ def _apply_fonts(root: "tk.Tk"):
     fixed.configure(size=mono, family=mfam)
 
 def _recolor_tk_widgets(root: "tk.Tk", dark=True):
-    colors = _gfm_palette(dark)
+    colors = _set_palette(dark)
     def walk(w):
         if isinstance(w, (tk.Tk, tk.Toplevel, tk.Frame, tk.LabelFrame, tk.PanedWindow)):
             try: w.configure(bg=colors["bg"])
@@ -1413,7 +1364,7 @@ def _style_ttk(dark=True):
         style.theme_use("clam")
     except Exception:
         pass
-    c = _gfm_palette(dark)
+    c = _set_palette(dark)
     style.configure(".", background=c["bg"], foreground=c["text"])
     style.configure("TFrame", background=c["bg"])
     style.configure("TLabel", background=c["bg"], foreground=c["text"])
@@ -1433,7 +1384,7 @@ def _try_style_tksheet(root: "tk.Tk", dark=True):
         import tksheet
     except Exception:
         return
-    colors = _gfm_palette(dark)
+    colors = _set_palette(dark)
     def _sz(px):
         return max(8, int(round(px * UI_SCALE)))
     def walk(w):
@@ -1731,7 +1682,7 @@ class SpeechSheetApp:
         self._restore_main_window_geometry()
 
         # Status bar (bottom)
-        status_colors = _gfm_palette(True)
+        status_colors = _set_palette(True)
         self.status_frame = tk.Frame(root, bg=status_colors["surface"])
         self.status_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(0,8))
         self.template_status_label = tk.Label(
@@ -3261,7 +3212,7 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
 
         self.on_saved = on_saved or (lambda: None)
 
-        c = _gfm_palette(True)
+        c = _set_palette(True)
         self.configure(bg=c["bg"])
 
         # Topbar
@@ -3555,7 +3506,7 @@ class GlossaryListsAndMappingDialog(tk.Toplevel):
         self._col_vars.clear()
 
         lid = self._sel_list_id()
-        c = _gfm_palette(True)
+        c = _set_palette(True)
 
         if not lid:
             tk.Label(self._col_inner, text="Select a list to assign it to columns.",
@@ -3688,7 +3639,7 @@ class TemplateManagerDialog(tk.Toplevel):
         self.on_open = on_open
         self.before_duplicate = before_duplicate
 
-        c = _gfm_palette(True)
+        c = _set_palette(True)
         self.configure(bg=c["bg"])
 
         top = tk.Frame(self, bg=c["surface"]); top.pack(side="top", fill="x", padx=10, pady=(10, 6))
@@ -3940,7 +3891,7 @@ class SettingsDialog(tk.Toplevel):
 
         self._date_cols_pending = set(selected)
 
-        c = _gfm_palette(True)
+        c = _set_palette(True)
         self.configure(bg=c["bg"])
 
         # --- Scrollable content area (keeps bottom buttons visible) ---
@@ -3999,7 +3950,7 @@ class SettingsDialog(tk.Toplevel):
         
         def _style_btn_local(b):
             try:
-                c = _gfm_palette(True)
+                c = _set_palette(True)
                 b.configure(bg=c["button_bg"], fg=c["button_fg"],
                             activebackground=c["button_active_bg"], activeforeground=c["button_fg"],
                             relief="flat", highlightthickness=1,
@@ -4280,7 +4231,7 @@ class DateColumnsDialog(tk.Toplevel):
         self._cols = [(str(u or ""), str(h or "")) for (u, h) in columns]
         pre = set(str(x) for x in (selected_uids or []))
 
-        c = _gfm_palette(True)
+        c = _set_palette(True)
         self.configure(bg=c["bg"])
 
         tk.Label(self, text="Mark the columns that should receive date normalization:",
@@ -4389,7 +4340,7 @@ class AppendColumnsDialog(tk.Toplevel):
         self._cols = [(str(u or ""), str(h or "")) for (u, h) in columns]
         self._sel = set(str(x) for x in (selected_uids or []))
 
-        c = _gfm_palette(True)
+        c = _set_palette(True)
         self.configure(bg=c["bg"])
 
         tk.Label(self, text="Mark the columns where new text should be APPENDED:",
