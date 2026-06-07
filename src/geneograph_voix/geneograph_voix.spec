@@ -18,7 +18,7 @@ hiddenimports += collect_submodules('faster_whisper')
 hiddenimports += collect_submodules('tokenizers')
 
 # Ensure Xet plugin is bundled
-hiddenimports += ['hf_xet', 'pyxet']
+hiddenimports += ['hf_xet']
 
 # Explicit hidden imports for dynamic dependencies
 hiddenimports += ['requests']
@@ -26,14 +26,11 @@ hiddenimports += ['requests']
 binaries  = []
 binaries += collect_dynamic_libs('ctranslate2')
 binaries += collect_dynamic_libs('tokenizers')
-# pyxet may ship native bits on some platforms; collect them if present
-binaries += collect_dynamic_libs('pyxet')
 
 datas  = []
 datas += collect_data_files('tksheet', include_py_files=False)
-# include plugin packages’ data so importlib can find them at runtime
+# include plugin packages' data so importlib can find them at runtime
 datas += collect_data_files('hf_xet', include_py_files=True)
-datas += collect_data_files('pyxet', include_py_files=True)
 
 # --- IMPORTANT: ship icon files for Tk window icon at runtime ---
 if os.path.exists(ICO_PATH):
