@@ -24,3 +24,8 @@ def _no_speech_thresholds():
     cr_preview  = {1:2.40, 2:2.30, 3:2.20, 4:2.10, 5:2.05}[l]
     cr_commit   = {1:2.20, 2:2.10, 3:2.00, 4:1.95, 5:1.90}[l]
     return preview_nst, commit1_nst, commit2_nst, cr_preview, cr_commit
+
+# ---------------------------
+# Glossary strictness (1..5)
+# ---------------------------
+GLOSSARY_STRICTNESS = 3
