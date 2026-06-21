@@ -21,15 +21,15 @@ SILERO_DEVICE = DEVICE
 def _load_silero_vad():
     global _silero_model, _get_speech_ts
     try:
-        _silero_model, _silero_utils = torch.hub.load(
+        _silero_model = torch.hub.load(
             repo_or_dir='snakers4/silero-vad',
             model='silero_vad',
             trust_repo=True,
             force_reload=False
         )
-        (_get_speech_ts, *_rest) = _silero_utils
-        _silero_model.to(SILERO_DEVICE)
-        _silero_model.eval()
+        _get_speech_ts = _silero_model.get_speech_ts  # type: ignore[attr-defined]
+        _silero_model.to(SILERO_DEVICE)  # type: ignore[attr-defined]
+        _silero_model.eval()  # type: ignore[attr-defined]
         if SILERO_DEVICE == "cpu":
             try:
                 torch.set_num_threads(1)
