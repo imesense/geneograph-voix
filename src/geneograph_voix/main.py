@@ -1,5 +1,4 @@
 ﻿import threading
-import queue
 import time
 import os
 import sys
@@ -37,7 +36,6 @@ from geneograph_voix.Models.Config import (
     _MODELKEY_TO_LABEL,
     AUDIO_BLOCK_SEC,
     AUTOSAVE_EVERY_MS,
-    BAN_PHRASES,
     BLOCK_DURATION,
     COMMIT_MIN_SILENCE_SEC,
     COMMIT_TAIL_SILENCE_SEC,
@@ -79,7 +77,14 @@ from geneograph_voix.Models.GlossaryCorrectionEngine import (
     correct_text_for_column,
     normalize_date
 )
-from geneograph_voix.Models.GlossaryTextUtilities import AUDIO_QUEUE, _preview_is_banned, audio_callback, clean_person_field, is_silence, rms_db
+from geneograph_voix.Models.GlossaryTextUtilities import (
+    AUDIO_QUEUE,
+    _preview_is_banned,
+    audio_callback,
+    clean_person_field,
+    is_silence,
+    rms_db
+)
 from geneograph_voix.Models.LanguageHelpers import (
     _effective_language,
     _remove_punct_keep_hyphen,
@@ -90,8 +95,7 @@ from geneograph_voix.Models.ModelCoefficients import (
     GLOSSARY_STRICTNESS,
     VAD_STRICTNESS,
     _energy_gate_db,
-    _no_speech_thresholds,
-    _silero_params_for
+    _no_speech_thresholds
 )
 from geneograph_voix.Models.Settings import (
     LANGUAGE,
@@ -101,61 +105,17 @@ from geneograph_voix.Models.Settings import (
     _save_settings_file
 )
 from geneograph_voix.Models.Sheets import SHEET_BINDS
+from geneograph_voix.Models.SileroVadSettings import (
+    HAS_SILERO,
+    SILERO_DEVICE,
+    _load_silero_vad,
+    _silero_vad_trim
+)
 from geneograph_voix.Views.Palette import _set_palette
 
 _prepare_frozen_caches()
 
 os.makedirs(DATA_DIR, exist_ok=True)
-
-# ===========================
-# Silero VAD only
-# ===========================
-_has_silero = False
-_silero_device = DEVICE
-
-def _load_silero_vad():
-    global _has_silero, _silero_model, _get_speech_ts
-    try:
-        _silero_model, _silero_utils = torch.hub.load(
-            repo_or_dir='snakers4/silero-vad',
-            model='silero_vad',
-            trust_repo=True,
-            force_reload=False
-        )
-        (_get_speech_ts, *_rest) = _silero_utils
-        _silero_model.to(_silero_device)
-        _silero_model.eval()
-        if _silero_device == "cpu":
-            try:
-                torch.set_num_threads(1)
-            except Exception:
-                pass
-        _has_silero = True
-        print(f"Silero VAD ready on {_silero_device}")
-    except Exception as e:
-        print("Silero VAD not available:", e)
-        _has_silero = False
-
-def _silero_vad_trim(buf_f32: np.ndarray, sr: int = SAMPLERATE) -> Optional[np.ndarray]:
-    if not _has_silero or buf_f32 is None or getattr(buf_f32, "size", 0) == 0:
-        return buf_f32
-    p = _silero_params_for(VAD_STRICTNESS)
-    wav = torch.from_numpy(buf_f32).float()
-    ts = _get_speech_ts(
-        wav, _silero_model,
-        sampling_rate=sr,
-        threshold=p["th"],
-        min_speech_duration_ms=p["min_speech"],
-        min_silence_duration_ms=p["min_silence"],
-        speech_pad_ms=p["pad"],
-    )
-    if not ts:
-        return None
-    start = ts[0]["start"]; end = ts[-1]["end"]
-    trimmed = buf_f32[start:end]
-    if len(trimmed) < int(sr * 0.20):
-        return None
-    return trimmed
 
 # ===========================
 # Whisper model loading + wrapper
@@ -229,7 +189,7 @@ def transcribe_buffer_commit(buffer):
         return ""
     trimmed = mono
     try:
-        if _has_silero:
+        if HAS_SILERO:
             t = _silero_vad_trim(mono)
             if t is not None:
                 trimmed = t
@@ -673,7 +633,7 @@ class SpeechSheetApp:
         # Info line
         try:
             print(f"[Devices] Whisper device={DEVICE}; compute_type={COMPUTE_TYPE}; "
-                  f"Silero device={_silero_device}; torch.cuda={torch.cuda.is_available()}")
+                  f"Silero device={SILERO_DEVICE}; torch.cuda={torch.cuda.is_available()}")
             if torch.cuda.is_available():
                 print("[CUDA] device name:", torch.cuda.get_device_name(0))
         except Exception as _e:
