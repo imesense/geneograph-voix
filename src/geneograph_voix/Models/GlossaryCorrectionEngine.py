@@ -284,7 +284,7 @@ BEST_CACHE_SINGLE: dict[tuple[str, str, int], tuple[Optional[_Best], Optional[_B
 BEST_CACHE_MERGE: dict[tuple[str, str, int], tuple[Optional[_Best], Optional[_Best]]] = {}
 
 def _best_two_cached(header: str, a_norm: str, g_norm: list[tuple[str, str]], *, is_merge: bool) -> tuple[Optional[_Best], Optional[_Best]]:
-    key = (header, a_norm)
+    key = (header, a_norm, 1 if is_merge else 0)
     cache = BEST_CACHE_MERGE if is_merge else BEST_CACHE_SINGLE
     if key in cache:
         return cache[key]
@@ -382,7 +382,7 @@ def correct_text_for_column(text: str, header_key: str) -> str:
             a_join2 = _ru_norm_merge(joined2)
             if a_join2:
                 bestm2, runnerm2 = _best_two_cached(header_key, a_join2, g_norm_merge, is_merge=True)
-                if _should_correct_from_norm(a_join2, bestm2, runnerm2):
+                if bestm2 and _should_correct_from_norm(a_join2, bestm2, runnerm2):
                     if len(a_join2) >= 5 and (bestm2.lcp >= 3 or bestm2.lcs >= 3):
                         cand2 = (bestm2, _score_from_norm(a_join2, bestm2))
 
@@ -393,7 +393,7 @@ def correct_text_for_column(text: str, header_key: str) -> str:
             a_join123 = _ru_norm_merge(joined123)
             if a_join123:
                 bestm3a, runnerm3a = _best_two_cached(header_key, a_join123, g_norm_merge, is_merge=True)
-                if _should_correct_from_norm(a_join123, bestm3a, runnerm3a):
+                if bestm3a and _should_correct_from_norm(a_join123, bestm3a, runnerm3a):
                     if len(a_join123) >= 6 and (bestm3a.lcp >= 3 or bestm3a.lcs >= 3):
                         cand3 = (bestm3a, _score_from_norm(a_join123, bestm3a))
             tok2_clean = _ru_norm(tok2)
@@ -402,7 +402,7 @@ def correct_text_for_column(text: str, header_key: str) -> str:
                 a_join13 = _ru_norm_merge(joined13)
                 if a_join13:
                     bestm3b, runnerm3b = _best_two_cached(header_key, a_join13, g_norm_merge, is_merge=True)
-                    if _should_correct_from_norm(a_join13, bestm3b, runnerm3b):
+                    if bestm3b and _should_correct_from_norm(a_join13, bestm3b, runnerm3b):
                         if len(a_join13) >= 6 and (bestm3b.lcp >= 3 or bestm3b.lcs >= 3):
                             cand3 = (bestm3b, _score_from_norm(a_join13, bestm3b))
 
@@ -430,7 +430,7 @@ def correct_text_for_column(text: str, header_key: str) -> str:
 
         if a:
             best, runner = _best_two_cached(header_key, a, g_norm, is_merge=False)
-            if _should_correct(tok, best, runner):
+            if best and _should_correct(tok, best, runner):
                 out.append(best.orig)
             else:
                 out.append(tok)
