@@ -5,3 +5,4 @@ pandas==1.5.3
 sounddevice==0.5.2
 tksheet==7.5.16
 webrtcvad-wheels==2.0.14
+send2trash==1.8.0
