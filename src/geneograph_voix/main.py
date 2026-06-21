@@ -5,7 +5,6 @@ import sys
 import re
 import unicodedata
 import torch
-import inspect
 
 import tkinter as tk
 import numpy as np
@@ -17,7 +16,6 @@ from contextlib import contextmanager
 from typing import Optional, List, Tuple, Callable
 from tkinter import filedialog, messagebox, simpledialog
 from tksheet import Sheet
-from faster_whisper import WhisperModel
 
 from geneograph_voix.Helpers.ScreenHelpers import (
     _fit_to_screen,
@@ -50,14 +48,10 @@ from geneograph_voix.Models.Config import (
     SPEED_MODE,
     TABLE_ZOOM_PCT,
     UI_SCALE,
-    _model_id_for_key,
     _preview_tail_sec
 )
 from geneograph_voix.Models.Devices import (
     DEVICE,
-    CPU_THREADS,
-    NUM_WORKERS,
-    _resolve_compute_type,
 )
 from geneograph_voix.Models.GlobalGlossaryLists import (
     GLOSSARY_LISTS,
@@ -111,53 +105,18 @@ from geneograph_voix.Models.SileroVadSettings import (
     _load_silero_vad,
     _silero_vad_trim
 )
+from geneograph_voix.Models.WhisperModelWrapper import (
+    COMPUTE_TYPE,
+    _load_whisper_model,
+    _pick_default_model_key,
+    _warmup_model,
+    fw_transcribe
+)
 from geneograph_voix.Views.Palette import _set_palette
 
 _prepare_frozen_caches()
 
 os.makedirs(DATA_DIR, exist_ok=True)
-
-# ===========================
-# Whisper model loading + wrapper
-# ===========================
-model: Optional[WhisperModel] = None
-COMPUTE_TYPE = None
-
-def _pick_default_model_key() -> str:
-    return "large-v3-turbo" if DEVICE == "cuda" else "base"
-
-def _load_whisper_model(model_key: str):
-    global model, COMPUTE_TYPE
-    model_id = _model_id_for_key(model_key)
-    chain, first = _resolve_compute_type(DEVICE)
-    last_err = None
-    for ct in chain:
-        try:
-            print(f"Loading Whisper model '{model_id}' on {DEVICE} with compute_type={ct} ...")
-            model = WhisperModel(model_id, device=DEVICE, compute_type=ct)
-            COMPUTE_TYPE = ct
-            print(f"Whisper ready: compute_type={ct}")
-            return
-        except Exception as e:
-            print(f"compute_type '{ct}' failed -> {e}")
-            last_err = e
-    raise last_err
-
-def _warmup_model():
-    try:
-        dummy = np.zeros((SAMPLERATE // 2,), dtype=np.float32)
-        list(fw_transcribe(dummy, beam_size=1, temperature=0.0, without_timestamps=True))
-    except Exception as e:
-        print("Warmup failed (non-fatal):", e)
-
-def fw_transcribe(audio, **kwargs):
-    if CPU_THREADS is not None:
-        kwargs.setdefault("cpu_threads", CPU_THREADS)
-    if NUM_WORKERS is not None:
-        kwargs.setdefault("num_workers", NUM_WORKERS)
-    params = inspect.signature(model.transcribe).parameters
-    safe_kwargs = {k: v for k, v in kwargs.items() if k in params}
-    return model.transcribe(audio, **safe_kwargs)
 
 # ===========================
 # Decoding functions
