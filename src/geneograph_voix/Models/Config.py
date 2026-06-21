@@ -1,4 +1,10 @@
 import os
+import time
+
+# Application settings
+
+LAST_ACTIVITY_TS = time.monotonic()
+SILENCE_GUARD_GRACE_SEC = 5.0
 
 # =========================================
 # Global config / settings
