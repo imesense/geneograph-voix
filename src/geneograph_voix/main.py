@@ -79,6 +79,13 @@ from geneograph_voix.Models.GlossaryCorrectionEngine import (
     correct_text_for_column,
     normalize_date
 )
+from geneograph_voix.Models.GlossaryTextUtilities import AUDIO_QUEUE, _preview_is_banned, audio_callback, clean_person_field, is_silence, rms_db
+from geneograph_voix.Models.LanguageHelpers import (
+    _effective_language,
+    _remove_punct_keep_hyphen,
+    looks_like_outro,
+    strip_trailing_dot
+)
 from geneograph_voix.Models.ModelCoefficients import (
     GLOSSARY_STRICTNESS,
     VAD_STRICTNESS,
@@ -99,57 +106,6 @@ from geneograph_voix.Views.Palette import _set_palette
 _prepare_frozen_caches()
 
 os.makedirs(DATA_DIR, exist_ok=True)
-
-# =========================================
-# Glossary + text utilities (adapted)
-# =========================================
-def _preview_is_banned(text: str) -> bool:
-    try:
-        return looks_like_outro(text)
-    except Exception:
-        t = (text or "").lower().replace("ё", "е")
-        t = re.sub(r"[^a-zа-я0-9\s]+", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
-        if "продолжение следует" in t:
-            return True
-        return any(p in t for p in BAN_PHRASES)
-
-def clean_person_field(text: str) -> str:
-    t = text or ""
-    t = re.sub(r"[^A-Za-zА-Яа-яЁё\-]+", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    if not t:
-        return ""
-    return " ".join(w[:1].upper() + w[1:].lower() if w else "" for w in t.split())
-
-audio_queue = queue.Queue()
-
-def audio_callback(indata, frames, time_info, status):
-    if status:
-        print("⚠️", status)
-    global LAST_ACTIVITY_TS
-    try:
-        x = np.asarray(indata, dtype=np.float32)
-        if x.size > 0:
-            if rms_db(x.flatten()) > (_energy_gate_db() + 3.0):
-                LAST_ACTIVITY_TS = time.monotonic()
-    except Exception:
-        LAST_ACTIVITY_TS = time.monotonic()
-    audio_queue.put(indata.copy())
-
-def rms_db(x: np.ndarray) -> float:
-    if x.size == 0:
-        return -120.0
-    x = x.astype(np.float64)
-    rms = np.sqrt(np.mean(x**2))
-    return 20*np.log10(rms + 1e-12)
-
-def is_silence(buf: np.ndarray, threshold_db: Optional[float] = None) -> bool:
-    if buf is None or getattr(buf, "size", 0) == 0:
-        return True
-    if threshold_db is None:
-        threshold_db = _energy_gate_db()
-    return rms_db(np.asarray(buf).flatten()) < float(threshold_db)
 
 # ===========================
 # Silero VAD only
@@ -242,64 +198,6 @@ def fw_transcribe(audio, **kwargs):
     params = inspect.signature(model.transcribe).parameters
     safe_kwargs = {k: v for k, v in kwargs.items() if k in params}
     return model.transcribe(audio, **safe_kwargs)
-
-# ===========================
-# Language helpers + outro
-# ===========================
-def _effective_language():
-    if LANGUAGE is None:
-        return None
-    if isinstance(LANGUAGE, str) and LANGUAGE.strip().lower() in ("", "auto"):
-        return None
-    return LANGUAGE
-
-def _norm_text_basic(s: str) -> str:
-    t = (s or "").lower()
-    t = t.replace("ё", "е")
-    t = re.sub(r"[^a-zа-я0-9\s]+", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-def looks_like_outro(s: str) -> bool:
-    t = _norm_text_basic(s)
-    if any(_norm_text_basic(p) in t for p in BAN_PHRASES):
-        return True
-    if "продолжение следует" in t:
-        return True
-    if "субтитры" in t and ("сделал" in t or "создал" in t or "создавал" in t):
-        return True
-    t_c = t.replace(" ", "")
-    if ("dimator" in t_c) or ("dimatorzhok" in t_c) or ("dimatorzok" in t_c) or ("диматоржок" in t_c):
-        return True
-    return False
-
-def strip_trailing_dot(text: str) -> str:
-    if text is None:
-        return ""
-    s = str(text).rstrip()
-    while s.endswith(".") or s.endswith("…"):
-        s = s[:-1]
-    return s
-
-def _remove_punct_keep_hyphen(text: str) -> str:
-    """
-    Remove all punctuation but keep hyphens/dashes. Collapses spaces.
-    Keeps: '-' U+002D, '–' U+2013, '—' U+2014.
-    """
-    if not text:
-        return ""
-    keep = "-–—"
-    out = []
-    for ch in str(text):
-        cat = unicodedata.category(ch)
-        if cat and cat.startswith("P") and ch not in keep:
-            out.append(" ")
-        else:
-            out.append(ch)
-    t = "".join(out)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
 
 # ===========================
 # Decoding functions
@@ -1938,8 +1836,8 @@ class SpeechSheetApp:
                 continue
 
             got_any = False
-            while not audio_queue.empty():
-                blk = audio_queue.get()
+            while not AUDIO_QUEUE.empty():
+                blk = AUDIO_QUEUE.get()
                 got_any = True
                 self._commit_chunks.append(blk)
                 self._commit_total_samples += len(blk)
@@ -2037,10 +1935,9 @@ class SpeechSheetApp:
             time.sleep(0.02)
 
     def reset_audio_state(self):
-        global audio_queue
         try:
-            while not audio_queue.empty():
-                audio_queue.get_nowait()
+            while not AUDIO_QUEUE.empty():
+                AUDIO_QUEUE.get_nowait()
         except Exception:
             pass
         self.buffer = np.zeros((0,1), dtype=np.float32)
