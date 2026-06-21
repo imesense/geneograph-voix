@@ -2,24 +2,20 @@
 import queue
 import time
 import os
-import json
 import sys
 import re
 import warnings
 import unicodedata
 import torch
 import inspect
-import uuid
 
 import tkinter as tk
 import numpy as np
 import pandas as pd
 import sounddevice as sd
 
-from collections import namedtuple, deque
+from collections import deque
 from contextlib import contextmanager
-from datetime import date
-from functools import lru_cache
 from typing import Optional, List, Tuple, Callable
 from tkinter import filedialog, messagebox, simpledialog
 from tksheet import Sheet
@@ -48,22 +44,15 @@ from geneograph_voix.Models.Config import (
     COMMIT_TAIL_SILENCE_SEC,
     DATA_DIR,
     DATA_FILE,
-    GLOSSARIES_FILE,
     MALE_EXCEPTIONS,
-    MODEL_CHOICES,
     NAME_COLUMNS,
     PREVIEW_CLEAR_DELAY_MS,
     PREVIEW_MIN_INTERVAL_SEC,
-    PREVIEW_TAIL_SEC_DEFAULT,
-    PREVIEW_TAIL_SEC_SPEED,
     REMOVE_PUNCT,
     SAMPLERATE,
-    SETTINGS_FILE,
     SPEED_MODE,
     TABLE_ZOOM_PCT,
-    TEMPLATES_FILE,
     UI_SCALE,
-    WHISPER_LANG_CHOICES,
     _model_id_for_key,
     _preview_tail_sec
 )
