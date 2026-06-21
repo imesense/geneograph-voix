@@ -4,7 +4,6 @@ import time
 import os
 import sys
 import re
-import warnings
 import unicodedata
 import torch
 import inspect
@@ -56,6 +55,12 @@ from geneograph_voix.Models.Config import (
     _model_id_for_key,
     _preview_tail_sec
 )
+from geneograph_voix.Models.Devices import (
+    DEVICE,
+    CPU_THREADS,
+    NUM_WORKERS,
+    _resolve_compute_type,
+)
 from geneograph_voix.Models.GlobalGlossaryLists import (
     GLOSSARY_LISTS,
     _active_template_record,
@@ -94,71 +99,6 @@ from geneograph_voix.Views.Palette import _set_palette
 _prepare_frozen_caches()
 
 os.makedirs(DATA_DIR, exist_ok=True)
-
-# =========================================
-# Devices, threading, compute types
-# =========================================
-warnings.filterwarnings("ignore")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-def _detect_physical_cores() -> Optional[int]:
-    try:
-        import importlib
-        psutil = importlib.import_module("psutil")
-        n = psutil.cpu_count(logical=False) or 0
-        if n > 0:
-            return int(n)
-    except Exception:
-        pass
-    try:
-        if sys.platform.startswith("win"):
-            import subprocess
-            out = subprocess.check_output(["wmic", "cpu", "get", "NumberOfCores"], text=True)
-            nums = [int(x) for x in re.findall(r"\d+", out)]
-            if nums:
-                return sum(nums)
-    except Exception:
-        pass
-    try:
-        if sys.platform.startswith("linux"):
-            import subprocess
-            out = subprocess.check_output(["lscpu", "-p=Core"], text=True)
-            ids = set()
-            for line in out.splitlines():
-                if line.startswith("#") or not line.strip():
-                    continue
-                core_id = line.split(",")[0].strip()
-                if core_id:
-                    ids.add(core_id)
-            if ids:
-                return len(ids)
-    except Exception:
-        pass
-    try:
-        n = os.cpu_count()
-        return int(n) if n else None
-    except Exception:
-        return None
-
-CPU_THREADS: Optional[int] = None
-NUM_WORKERS: Optional[int] = None
-_physical = _detect_physical_cores()
-if _physical:
-    CPU_THREADS = max(2, min(_physical, 8))
-    NUM_WORKERS = 1
-    os.environ.setdefault("OMP_NUM_THREADS", str(CPU_THREADS))
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-
-def _resolve_compute_type(device: str) -> Tuple[List[str], str]:
-    env_ct = os.getenv("WHISPER_COMPUTE_TYPE") or os.getenv("FAST_WHISPER_COMPUTE_TYPE")
-    if env_ct:
-        return [env_ct], env_ct
-    if device == "cuda":
-        chain = ["float16", "int8_float16", "float32"]
-        return chain, chain[0]
-    else:
-        chain = ["int8", "float32"]
-        return chain, chain[0]
 
 # =========================================
 # Glossary + text utilities (adapted)
@@ -215,7 +155,7 @@ def is_silence(buf: np.ndarray, threshold_db: Optional[float] = None) -> bool:
 # Silero VAD only
 # ===========================
 _has_silero = False
-_silero_device = "cuda" if torch.cuda.is_available() else "cpu"
+_silero_device = DEVICE
 
 def _load_silero_vad():
     global _has_silero, _silero_model, _get_speech_ts
@@ -268,17 +208,17 @@ model: Optional[WhisperModel] = None
 COMPUTE_TYPE = None
 
 def _pick_default_model_key() -> str:
-    return "large-v3-turbo" if device == "cuda" else "base"
+    return "large-v3-turbo" if DEVICE == "cuda" else "base"
 
 def _load_whisper_model(model_key: str):
     global model, COMPUTE_TYPE
     model_id = _model_id_for_key(model_key)
-    chain, first = _resolve_compute_type(device)
+    chain, first = _resolve_compute_type(DEVICE)
     last_err = None
     for ct in chain:
         try:
-            print(f"Loading Whisper model '{model_id}' on {device} with compute_type={ct} ...")
-            model = WhisperModel(model_id, device=device, compute_type=ct)
+            print(f"Loading Whisper model '{model_id}' on {DEVICE} with compute_type={ct} ...")
+            model = WhisperModel(model_id, device=DEVICE, compute_type=ct)
             COMPUTE_TYPE = ct
             print(f"Whisper ready: compute_type={ct}")
             return
@@ -834,7 +774,7 @@ class SpeechSheetApp:
 
         # Info line
         try:
-            print(f"[Devices] Whisper device={device}; compute_type={COMPUTE_TYPE}; "
+            print(f"[Devices] Whisper device={DEVICE}; compute_type={COMPUTE_TYPE}; "
                   f"Silero device={_silero_device}; torch.cuda={torch.cuda.is_available()}")
             if torch.cuda.is_available():
                 print("[CUDA] device name:", torch.cuda.get_device_name(0))
