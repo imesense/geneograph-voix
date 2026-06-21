@@ -76,6 +76,7 @@ from geneograph_voix.Models.ModelCoefficients import (
 )
 from geneograph_voix.Models.Settings import (
     LANGUAGE,
+    MODEL_KEY,
     _apply_settings_to_globals,
     _read_settings_from_file,
     _save_settings_file
