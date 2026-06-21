@@ -33,9 +33,14 @@ def _load_whisper_model(model_key: str):
         except Exception as e:
             print(f"compute_type '{ct}' failed -> {e}")
             last_err = e
-    raise last_err
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"No compute types available for device '{DEVICE}'")
 
 def _warmup_model():
+    if model is None:
+        print("Warmup skipped: model not loaded yet")
+        return
     try:
         dummy = np.zeros((SAMPLERATE // 2,), dtype=np.float32)
         list(fw_transcribe(dummy, beam_size=1, temperature=0.0, without_timestamps=True))
@@ -43,6 +48,8 @@ def _warmup_model():
         print("Warmup failed (non-fatal):", e)
 
 def fw_transcribe(audio, **kwargs):
+    if model is None:
+        raise RuntimeError("Whisper model not loaded. Call _load_whisper_model first.")
     if CPU_THREADS is not None:
         kwargs.setdefault("cpu_threads", CPU_THREADS)
     if NUM_WORKERS is not None:
