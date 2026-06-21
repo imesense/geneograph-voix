@@ -3,6 +3,8 @@ import sys
 
 import tkinter as tk
 
+from typing import Union
+
 def _set_windows_dpi_awareness():
     try:
         import ctypes
@@ -114,7 +116,7 @@ def _fit_to_screen_bounds(root, w, h, x, y):
     y = max(work_y, min(y, work_y + work_h - h))
     return w, h, x, y
 
-def _fit_to_screen(win: "tk.Tk", margin: int = 60):
+def _fit_to_screen(win: Union[tk.Tk, tk.Toplevel], margin: int = 60):
     """
     Make the window big enough to show all content (up to screen - margin)
     and center it. Uses *required* size so bottom buttons aren't cut off.

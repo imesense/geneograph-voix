@@ -3,6 +3,8 @@ import sys
 
 import tkinter as tk
 
+from typing import Union
+
 from geneograph_voix.Helpers.ResourceHelpers import _resource_path
 from geneograph_voix.Helpers.ScreenHelpers import _set_windows_dpi_awareness
 from geneograph_voix.Models.Config import UI_SCALE
@@ -23,7 +25,7 @@ except Exception:
 APP_ICON_ICO = "app.ico"        # put the same .ico you use with PyInstaller here
 APP_ICON_PNG = "app_256.png"    # optional: for non-Windows, a PNG works best
 
-def _set_app_icon(root: "tk.Tk"):
+def _set_app_icon(root: Union[tk.Tk, tk.Toplevel]):
     """Set the app/window icon robustly across platforms/bundles."""
     try:
         if sys.platform.startswith("win"):
@@ -38,14 +40,14 @@ def _set_app_icon(root: "tk.Tk"):
                 img = tk.PhotoImage(file=png)
                 root.iconphoto(True, img)
                 # Prevent image from being garbage-collected
-                root._app_icon_img = img
+                root._app_icon_img = img  # type: ignore[attr-defined]
     except Exception as e:
         print("icon set warn:", e)
 
 # Remember the original Tk scaling so re-applying doesn't multiply it
 _BASE_TK_SCALING = None
 
-def _auto_scaling(root: "tk.Tk"):
+def _auto_scaling(root: Union[tk.Tk, tk.Toplevel]):
     global _BASE_TK_SCALING
     try:
         if _BASE_TK_SCALING is None:
@@ -56,7 +58,7 @@ def _auto_scaling(root: "tk.Tk"):
     except Exception:
         pass
 
-def _apply_fonts(root: "tk.Tk"):
+def _apply_fonts(root: Union[tk.Tk, tk.Toplevel]):
     if not tkfont:
         return
     try:
@@ -77,7 +79,7 @@ def _apply_fonts(root: "tk.Tk"):
     heading.configure(size=hsize, weight="bold", family=hfam)
     fixed.configure(size=mono, family=mfam)
 
-def _recolor_tk_widgets(root: "tk.Tk", dark=True):
+def _recolor_tk_widgets(root: Union[tk.Tk, tk.Toplevel], dark=True):
     colors = _set_palette(dark)
     def walk(w):
         if isinstance(w, (tk.Tk, tk.Toplevel, tk.Frame, tk.LabelFrame, tk.PanedWindow)):
@@ -157,7 +159,7 @@ def _style_ttk(dark=True):
               selectbackground=[("readonly", c["sel_bg"])],
               selectforeground=[("readonly", c["sel_fg"])])
 
-def _try_style_tksheet(root: "tk.Tk", dark=True):
+def _try_style_tksheet(root: Union[tk.Tk, tk.Toplevel], dark=True):
     try:
         import tksheet
     except Exception:
@@ -193,7 +195,7 @@ def _try_style_tksheet(root: "tk.Tk", dark=True):
                 walk(c)
     walk(root)
 
-def _apply_dark_ui(root: "tk.Tk", dark=True):
+def _apply_dark_ui(root: Union[tk.Tk, tk.Toplevel], dark=True):
     _set_windows_dpi_awareness()
     _auto_scaling(root)
     _apply_fonts(root)
@@ -201,7 +203,7 @@ def _apply_dark_ui(root: "tk.Tk", dark=True):
     _recolor_tk_widgets(root, dark=dark)
     _try_style_tksheet(root, dark=dark)
 
-def enable_crisp_dark_mode(root: "tk.Tk", dark=True, delay_ms=350):
+def enable_crisp_dark_mode(root: Union[tk.Tk, tk.Toplevel], dark=True, delay_ms=350):
     try:
         root.after(delay_ms, lambda: _apply_dark_ui(root, dark=dark))
     except Exception:

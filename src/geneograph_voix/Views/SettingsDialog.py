@@ -27,6 +27,9 @@ except Exception:
 # Settings dialog (unchanged, except reset widths now per-template)
 # ===========================
 class SettingsDialog(tk.Toplevel):
+    _append_cols_columns: list[tuple[str, str]]
+    _append_cols_pending: set[str]
+
     def __init__(self, master, initial: dict, 
                  on_apply: Callable[[dict], None], 
                  on_reset_widths: Optional[Callable[[], None]] = None,
