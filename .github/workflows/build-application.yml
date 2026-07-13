@@ -66,6 +66,7 @@ jobs:
         strategy:
             matrix:
                 system:
+                    - windows-2022
                     - ubuntu-24.04
 
         runs-on: ${{ matrix.system }}
@@ -90,32 +91,24 @@ jobs:
                       Application-${{ hashFiles('**/requirements*.txt') }}
                       Application-
                   path: |
-                      .pip/
+                      ${{ github.workspace }}/.pip/
 
             - name: Setup dependencies
               run: |
                   pip install `
                       -r ${{ github.workspace }}/requirements.txt `
-                      --cache-dir ${{ github.workspace }}/.pip
+                      --cache-dir ${{ github.workspace }}/.pip/
                   pip install `
                       -r ${{ github.workspace }}/src/geneograph_voix/requirements.txt `
-                      --cache-dir ${{ github.workspace }}/.pip
+                      --cache-dir ${{ github.workspace }}/.pip/
                   pip install `
                       -r ${{ github.workspace }}/src/geneograph_voix/requirements_cuda.txt `
-                      --cache-dir ${{ github.workspace }}/.pip
+                      --cache-dir ${{ github.workspace }}/.pip/
 
             - name: Pack application
               run: |
                   pyinstaller `
                       ${{ github.workspace }}/src/geneograph_voix/geneograph_voix.spec
-
-            - name: Upload cache
-              uses: actions/upload-artifact@v7
-              with:
-                  name: ${{ github.event.repository.name }}-cache-${{ matrix.system }}-${{ github.sha }}
-                  path: |
-                      ${{ github.workspace }}/.pip/
-                  overwrite: true
 
             - name: Upload application
               uses: actions/upload-artifact@v7
