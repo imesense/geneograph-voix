@@ -1,10 +1,10 @@
 import numpy as np
 
-from geneograph_voix.Models.GlossaryTextUtilities import (
+from geneograph_voix.Helpers.Audio import (
     is_silence,
     rms_db
 )
-from geneograph_voix.Models.LanguageHelpers import (
+from geneograph_voix.Helpers.Language import (
     _effective_language,
     looks_like_outro,
     strip_trailing_dot
@@ -13,11 +13,11 @@ from geneograph_voix.Models.ModelCoefficients import (
     _energy_gate_db,
     _no_speech_thresholds
 )
-from geneograph_voix.Models.SileroVadSettings import (
+from geneograph_voix.Models.SileroVad import (
     HAS_SILERO,
     _silero_vad_trim
 )
-from geneograph_voix.Models.WhisperModelWrapper import (
+from geneograph_voix.Models.WhisperModel import (
     fw_transcribe
 )
 

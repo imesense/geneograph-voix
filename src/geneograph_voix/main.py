@@ -3,7 +3,7 @@ import sys
 
 import tkinter as tk
 
-from geneograph_voix.Helpers.ScreenHelpers import (
+from geneograph_voix.Helpers.Screen import (
     _fit_to_screen,
     _set_windows_dpi_awareness
 )
@@ -16,10 +16,10 @@ from geneograph_voix.Models.Settings import (
     _apply_settings_to_globals,
     _read_settings_from_file
 )
-from geneograph_voix.Models.SileroVadSettings import (
+from geneograph_voix.Models.SileroVad import (
     _load_silero_vad
 )
-from geneograph_voix.Models.WhisperModelWrapper import (
+from geneograph_voix.Models.WhisperModel import (
     _load_whisper_model,
     _pick_default_model_key,
     _warmup_model

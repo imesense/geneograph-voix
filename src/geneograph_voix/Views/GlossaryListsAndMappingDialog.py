@@ -5,9 +5,9 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog
 from typing import Optional
 
-from geneograph_voix.Helpers.ScreenHelpers import _fit_to_screen
+from geneograph_voix.Helpers.Screen import _fit_to_screen
 from geneograph_voix.Models.Config import UI_SCALE
-from geneograph_voix.Models.GlobalGlossaryLists import (
+from geneograph_voix.Models.GlossaryLists import (
     GLOSSARY_LISTS,
     _active_template_record,
     _ensure_templates_file,

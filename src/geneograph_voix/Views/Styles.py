@@ -5,8 +5,8 @@ import tkinter as tk
 
 from typing import Union
 
-from geneograph_voix.Helpers.ResourceHelpers import _resource_path
-from geneograph_voix.Helpers.ScreenHelpers import _set_windows_dpi_awareness
+from geneograph_voix.Helpers.Resources import _resource_path
+from geneograph_voix.Helpers.Screen import _set_windows_dpi_awareness
 from geneograph_voix.Models.Config import UI_SCALE
 from geneograph_voix.Views.Palette import _set_palette
 

@@ -3,7 +3,7 @@ import tkinter as tk
 from typing import Optional, Callable
 from tkinter import messagebox
 
-from geneograph_voix.Helpers.ScreenHelpers import _fit_to_screen
+from geneograph_voix.Helpers.Screen import _fit_to_screen
 from geneograph_voix.Models.Config import (
     _CODE_TO_LABEL,
     _LABEL_TO_CODE,
@@ -12,7 +12,7 @@ from geneograph_voix.Models.Config import (
     _MODEL_LABELS,
     _MODELKEY_TO_LABEL
 )
-from geneograph_voix.Models.WhisperModelWrapper import _pick_default_model_key
+from geneograph_voix.Models.WhisperModel import _pick_default_model_key
 from geneograph_voix.Views.AppendColumnsDialog import AppendColumnsDialog
 from geneograph_voix.Views.DateColumnsDialog import DateColumnsDialog
 from geneograph_voix.Views.Palette import _set_palette

@@ -2,7 +2,7 @@ import tkinter as tk
 
 from typing import List, Tuple, Callable
 
-from geneograph_voix.Helpers.ScreenHelpers import _fit_to_screen
+from geneograph_voix.Helpers.Screen import _fit_to_screen
 from geneograph_voix.Views.Palette import _set_palette
 from geneograph_voix.Views.Styles import enable_crisp_dark_mode
 

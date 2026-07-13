@@ -16,7 +16,20 @@ from tkinter import filedialog, messagebox, simpledialog
 from tksheet import Sheet
 from typing import List, Optional
 
-from geneograph_voix.Helpers.ScreenHelpers import (
+from geneograph_voix.Helpers.Audio import (
+    AUDIO_QUEUE,
+    _preview_is_banned,
+    audio_callback,
+    clean_person_field,
+    is_silence,
+    rms_db
+)
+from geneograph_voix.Helpers.Language import (
+    _remove_punct_keep_hyphen,
+    looks_like_outro,
+    strip_trailing_dot
+)
+from geneograph_voix.Helpers.Screen import (
     _fit_to_screen,
     _fit_to_screen_bounds,
     _parse_geometry
@@ -40,12 +53,12 @@ from geneograph_voix.Models.Config import (
     UI_SCALE,
     _preview_tail_sec
 )
-from geneograph_voix.Models.Decoding import (
+from geneograph_voix.Models.Transcription import (
     transcribe_buffer,
     transcribe_buffer_commit
 )
 from geneograph_voix.Models.Devices import DEVICE
-from geneograph_voix.Models.GlobalGlossaryLists import (
+from geneograph_voix.Models.GlossaryLists import (
     GLOSSARY_LISTS,
     _active_template_record,
     _data_path_for_template,
@@ -56,24 +69,11 @@ from geneograph_voix.Models.GlobalGlossaryLists import (
     _write_templates_file,
     load_glossary_lists
 )
-from geneograph_voix.Models.GlossaryCorrectionEngine import (
+from geneograph_voix.Models.GlossaryCorrection import (
     GLOSSARIES,
     _clear_best_caches,
     correct_text_for_column,
     normalize_date
-)
-from geneograph_voix.Models.GlossaryTextUtilities import (
-    AUDIO_QUEUE,
-    _preview_is_banned,
-    audio_callback,
-    clean_person_field,
-    is_silence,
-    rms_db
-)
-from geneograph_voix.Models.LanguageHelpers import (
-    _remove_punct_keep_hyphen,
-    looks_like_outro,
-    strip_trailing_dot
 )
 from geneograph_voix.Models.ModelCoefficients import (
     GLOSSARY_STRICTNESS,
@@ -87,9 +87,9 @@ from geneograph_voix.Models.Settings import (
     _read_settings_from_file,
     _save_settings_file
 )
-from geneograph_voix.Models.Sheets import SHEET_BINDS
-from geneograph_voix.Models.SileroVadSettings import SILERO_DEVICE
-from geneograph_voix.Models.WhisperModelWrapper import (
+from geneograph_voix.Models.SheetConfig import SHEET_BINDS
+from geneograph_voix.Models.SileroVad import SILERO_DEVICE
+from geneograph_voix.Models.WhisperModel import (
     COMPUTE_TYPE,
     _load_whisper_model,
     _pick_default_model_key,

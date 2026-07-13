@@ -6,8 +6,8 @@ import numpy as np
 
 from typing import Optional
 
+from geneograph_voix.Helpers.Language import looks_like_outro
 from geneograph_voix.Models.Config import BAN_PHRASES
-from geneograph_voix.Models.LanguageHelpers import looks_like_outro
 from geneograph_voix.Models.ModelCoefficients import _energy_gate_db
 
 # =========================================

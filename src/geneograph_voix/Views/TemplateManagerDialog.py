@@ -6,8 +6,8 @@ import pandas as pd
 from typing import Optional, Callable
 from tkinter import filedialog, messagebox, simpledialog
 
-from geneograph_voix.Helpers.ScreenHelpers import _fit_to_screen
-from geneograph_voix.Models.GlobalGlossaryLists import (
+from geneograph_voix.Helpers.Screen import _fit_to_screen
+from geneograph_voix.Models.GlossaryLists import (
     _data_path_for_template,
     _ensure_templates_file,
     _make_default_template,
